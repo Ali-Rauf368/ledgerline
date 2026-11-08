@@ -3,13 +3,22 @@ import { NewItemForm } from "@/components/forms";
 import { Badge, Card, CardHeader, Empty, Money, PageHeader } from "@/components/ui";
 import { getDb } from "@/lib/db";
 import { fmtMoney, fmtQty } from "@/lib/money";
-import { itemsOverview, warehouses } from "@/lib/reports";
+import { itemsOverview, reorderInsights, warehouses } from "@/lib/reports";
+import { AskCopilotButton } from "@/components/AskCopilotButton";
 
 export default function InventoryPage() {
   const db = getDb();
   const items = itemsOverview(db);
   const whs = warehouses(db);
   const total = items.reduce((s, i) => s + i.value, 0);
+  const reorder = reorderInsights(db);
+  const urgent = reorder.filter((r) => r.status === "critical" || r.status === "low");
+  const STATUS = {
+    critical: { label: "Reorder now", tone: "neg" as const, bar: "bg-neg" },
+    low: { label: "Reorder soon", tone: "warn" as const, bar: "bg-warn" },
+    healthy: { label: "Healthy", tone: "pos" as const, bar: "bg-pos" },
+    slow: { label: "No recent sales", tone: "neutral" as const, bar: "bg-muted" },
+  };
 
   return (
     <>
@@ -18,6 +27,38 @@ export default function InventoryPage() {
         title="Inventory"
         subtitle="Positions are read from the running balance stored on each stock movement, valued at moving-average cost in whole cents."
       />
+
+      <Card className="mb-6">
+        <CardHeader
+          title={<span className="flex items-center gap-2">Smart reorder <Badge tone={urgent.length ? "warn" : "pos"}>{urgent.length ? `${urgent.length} need attention` : "All covered"}</Badge></span>}
+          subtitle="Days of cover from 30-day sales velocity. Suggested quantities target 4 weeks of stock (7-day lead time)."
+          action={<AskCopilotButton question="What should I reorder this week, and roughly what will it cost at current average cost?" />}
+        />
+        <div className="grid gap-px bg-line sm:grid-cols-2 xl:grid-cols-4">
+          {reorder.map((r) => {
+            const st = STATUS[r.status];
+            const pct = r.daysCover === null ? 100 : Math.min(100, (r.daysCover / 42) * 100);
+            return (
+              <Link key={r.id} href={`/inventory/${r.id}`} className="group bg-surface p-4 transition hover:bg-surface-2/60">
+                <div className="flex items-start justify-between gap-2">
+                  <span className="min-w-0">
+                    <span className="block truncate text-sm font-medium text-ink group-hover:text-accent">{r.name}</span>
+                    <span className="font-mono text-[11px] text-muted">{r.sku}</span>
+                  </span>
+                  <Badge tone={st.tone}>{st.label}</Badge>
+                </div>
+                <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-surface-2">
+                  <div className={`h-full rounded-full ${st.bar}`} style={{ width: `${pct}%` }} />
+                </div>
+                <div className="num mt-2 flex justify-between text-[11px] text-muted">
+                  <span>{r.daysCover === null ? "—" : `${Math.round(r.daysCover)} days cover`} · {r.perDay.toFixed(1)}/day</span>
+                  {r.suggested > 0 && (r.status === "critical" || r.status === "low") && <span className="font-medium text-ink">order {fmtQty(r.suggested)}</span>}
+                </div>
+              </Link>
+            );
+          })}
+        </div>
+      </Card>
 
       <div className="grid gap-6 xl:grid-cols-[1fr_320px]">
         <Card>

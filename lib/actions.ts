@@ -91,3 +91,14 @@ export async function createItemAction(input: { sku: string; name: string; categ
     return fail(db, "Create item", e);
   }
 }
+
+import type { AssistantReply, ChatTurn } from "./assistant";
+import { askLedger } from "./assistant";
+
+export async function askAssistant(history: ChatTurn[]): Promise<AssistantReply> {
+  const clean = history
+    .filter((t) => (t.role === "user" || t.role === "assistant") && typeof t.text === "string" && t.text.trim())
+    .map((t) => ({ role: t.role, text: t.text.slice(0, 4000) }));
+  if (!clean.length || clean.at(-1)!.role !== "user") return { text: "Ask me something about your ledger.", tools: [], mode: "offline" };
+  return askLedger(getDb(), clean);
+}

@@ -2,7 +2,9 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { ArrowLeftRight, Boxes, CalendarCheck, FileBarChart, LayoutDashboard, Plus, ScrollText, ShieldCheck } from "lucide-react";
+import { openPalette } from "./CommandPalette";
+import { openCopilot } from "./Copilot";
+import { Search, Sparkles, ArrowLeftRight, Boxes, CalendarCheck, FileBarChart, LayoutDashboard, Plus, ScrollText, ShieldCheck } from "lucide-react";
 
 const NAV = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
@@ -41,7 +43,11 @@ export function Sidebar({ head }: { head: { id: number; hash: string } | null })
         <Link href="/transactions/new" className="mt-7 flex items-center justify-center gap-2 rounded-lg bg-white/10 px-3 py-2.5 text-sm font-medium text-white ring-1 ring-white/10 transition hover:bg-white/15">
           <Plus className="size-4" /> New transaction
         </Link>
-        <nav className="mt-6 flex flex-col gap-0.5">
+        <button onClick={openPalette} className="mt-3 flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm text-sidebar-ink ring-1 ring-white/5 transition hover:bg-white/5 hover:text-white">
+          <Search className="size-4 opacity-70" /> Search
+          <kbd className="ml-auto rounded bg-white/10 px-1.5 py-0.5 text-[10px]">⌘K</kbd>
+        </button>
+        <nav className="mt-5 flex flex-col gap-0.5">
           {NAV.map(({ href, label, icon: Icon }) => (
             <Link
               key={href}
@@ -55,7 +61,14 @@ export function Sidebar({ head }: { head: { id: number; hash: string } | null })
             </Link>
           ))}
         </nav>
-        <div className="mt-auto rounded-xl bg-sidebar-2 p-3.5 ring-1 ring-white/5">
+        <button onClick={() => openCopilot()} className="mt-auto mb-3 flex items-center gap-3 rounded-xl bg-gradient-to-br from-indigo-500/20 to-cyan-500/10 p-3 text-left ring-1 ring-indigo-400/20 transition hover:ring-indigo-400/50">
+          <span className="grid size-8 place-items-center rounded-lg bg-gradient-to-br from-indigo-500 to-cyan-500 text-white"><Sparkles className="size-4" /></span>
+          <span className="min-w-0">
+            <span className="block text-sm font-medium text-white">Ledger Copilot</span>
+            <span className="block text-[11px] text-sidebar-ink">Ask about your books · ⌘J</span>
+          </span>
+        </button>
+        <div className="rounded-xl bg-sidebar-2 p-3.5 ring-1 ring-white/5">
           <p className="flex items-center gap-1.5 text-[11px] font-medium text-emerald-300">
             <span className="size-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px] shadow-emerald-400" /> Append-only ledger
           </p>
@@ -70,9 +83,12 @@ export function Sidebar({ head }: { head: { id: number; hash: string } | null })
       <div className="sticky top-0 z-20 bg-sidebar lg:hidden">
         <div className="flex items-center justify-between px-4 py-3">
           <Logo />
+          <div className="flex items-center gap-1.5">
+          <button onClick={openPalette} aria-label="Search" className="grid size-8 place-items-center rounded-lg bg-white/10 text-white"><Search className="size-4" /></button>
           <Link href="/transactions/new" className="flex items-center gap-1.5 rounded-lg bg-white/10 px-3 py-1.5 text-xs font-medium text-white">
             <Plus className="size-3.5" /> New
           </Link>
+          </div>
         </div>
         <nav className="flex gap-1 overflow-x-auto px-3 pb-2.5 [scrollbar-width:none]">
           {NAV.map(({ href, label }) => (

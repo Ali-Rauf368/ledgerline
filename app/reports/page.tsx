@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { CheckCircle2, Clock, XCircle } from "lucide-react";
+import { CheckCircle2, Clock, Download, XCircle } from "lucide-react";
 import { Card, CardHeader, Money, PageHeader } from "@/components/ui";
 import type { AccountRow } from "@/lib/reports";
 import { balanceSheet, incomeStatement, inventoryValuation, trialBalance } from "@/lib/reports";
@@ -35,6 +35,11 @@ export default async function ReportsPage({ searchParams }: { searchParams: Prom
         eyebrow="Financial reporting"
         title="Reports"
         subtitle="Generated live from the journal. Pick any accounting date, and optionally a moment in time, to see the report exactly as it would have looked then."
+        actions={
+          <a className="btn-ghost" href={`/api/export?${new URLSearchParams(Object.entries({ report: tab, from: tab === "pl" ? from : "", asOf, knownAt: knownAtInput }).filter(([, v]) => v) as [string, string][])}`}>
+            <Download className="size-4" /> Export CSV
+          </a>
+        }
       />
 
       <div className="mb-5 flex gap-1 overflow-x-auto rounded-xl bg-surface-2 p-1 [scrollbar-width:none] sm:w-fit">

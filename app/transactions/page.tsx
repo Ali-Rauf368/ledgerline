@@ -26,7 +26,12 @@ export default async function JournalPage({ searchParams }: { searchParams: Prom
         eyebrow="General journal"
         title="Journal"
         subtitle="Every entry in posting order. Entries are never edited: a correction is a reversal linked to its original."
-        actions={<Link href="/transactions/new" className="btn-primary">New transaction</Link>}
+        actions={
+          <>
+            <a href="/api/export?report=journal" className="btn-ghost">Export CSV</a>
+            <Link href="/transactions/new" className="btn-primary">New transaction</Link>
+          </>
+        }
       />
 
       <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">

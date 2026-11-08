@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { ArrowRight, Banknote, Boxes, Percent, ShieldCheck, ShieldAlert, TrendingUp } from "lucide-react";
+import { AskCopilotButton } from "@/components/AskCopilotButton";
 import { BalanceTrend, RevenueChart } from "@/components/charts";
 import { Badge, Card, CardHeader, Empty, KindBadge, Money, PageHeader, Stat } from "@/components/ui";
 import { ACC } from "@/lib/accounts";
@@ -37,6 +38,7 @@ export default function Overview() {
         subtitle="Live figures computed straight from the append-only journal. Every number below can be traced to the entries that produced it."
         actions={
           <>
+            <AskCopilotButton label="Summarize this month" question="Give me a short briefing on this month so far: sales, margin, cash, anything that needs my attention." />
             <Link href="/reports" className="btn-ghost">Reports</Link>
             <Link href="/transactions/new" className="btn-primary">New transaction</Link>
           </>

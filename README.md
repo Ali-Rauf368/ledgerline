@@ -18,6 +18,15 @@ npm test         # ledger engine tests
 Requires Node 24+ (uses the built-in `node:sqlite`, so there is no database server to run).
 Data lives in `data/ledger.db`. Set `LEDGER_DB` to use another file.
 
+### Enable the AI assistant (optional)
+
+```bash
+cp .env.example .env.local   # then paste your key: ANTHROPIC_API_KEY=sk-ant-...
+```
+
+Without a key, Copilot still works in **offline mode**, answering common questions (reorder,
+revenue, cash, integrity, reversals) from the same data.
+
 ## What you can do
 
 | Page | Purpose |
@@ -30,6 +39,18 @@ Data lives in `data/ledger.db`. Set `LEDGER_DB` to use another file.
 | **Periods** | Close months in order; each close seals a SHA-256 snapshot |
 | **Integrity** | Eight independent checks that recompute everything from raw rows |
 | **Audit log** | Period closes, reversals, item creation and rejected posting attempts |
+
+### Productivity and AI
+
+- **Ledger Copilot (⌘J):** a chat assistant built on Claude (`claude-opus-5-5`) with nine **read-only**
+  tools: overview, inventory, reorder analysis, stock card, P&L, balance sheet, journal search,
+  journal detail and integrity check. It looks up real figures, links journal ids, and shows which
+  tools it used. It cannot post or change anything, so ledger integrity never depends on the model.
+- **Command palette (⌘K):** jump to any page, item or journal (`#123`), run actions, or send the
+  query straight to Copilot.
+- **Smart reorder:** days of cover from 30-day sales velocity, with suggested order quantities.
+- **CSV export:** every report (respecting the as-of and known-at filters) and the full journal with hashes.
+  Cells are protected against spreadsheet formula injection.
 
 ## How consistency is guaranteed
 
@@ -63,6 +84,8 @@ lib/integrity.ts   independent verifier (8 checks)
 lib/reports.ts     read models: TB, P&L, balance sheet, valuation, stock card, dashboard
 lib/db.ts          schema, append-only triggers, connection
 lib/actions.ts     Next.js server actions (thin layer over the engine)
+lib/assistant.ts   Ledger Copilot: Claude tool loop + offline fallback
+app/api/export     CSV export route
 app/               pages (App Router, server components)
 components/        UI: forms, charts, design primitives
 scripts/seed.ts    demo history generated through the real engine

@@ -343,3 +343,51 @@ export function periodsOverview(db: DB) {
 
 export const auditEvents = (db: DB) =>
   all<{ id: number; at: string; actor: string; action: string; detail: string }>(db, "SELECT * FROM audit_events ORDER BY id DESC LIMIT 300");
+
+export type ReorderRow = {
+  id: number;
+  sku: string;
+  name: string;
+  unit: string;
+  qty: number;
+  value: number;
+  sold30: number;
+  perDay: number;
+  daysCover: number | null;
+  suggested: number;
+  status: "critical" | "low" | "healthy" | "slow";
+};
+
+/**
+ * Demand-driven replenishment: 30-day sales velocity → days of cover.
+ * Target: cover lead time (7 days) + 3 weeks of safety/cycle stock.
+ */
+export function reorderInsights(db: DB, o: { leadDays?: number; targetDays?: number } = {}): ReorderRow[] {
+  const lead = o.leadDays ?? 7;
+  const target = o.targetDays ?? 28;
+  const since = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+  const sold = all<{ item_id: number; units: number }>(
+    db,
+    `SELECT m.item_id, -SUM(m.qty) units FROM stock_moves m JOIN journals j ON j.id = m.journal_id
+     WHERE j.kind = 'SALE' AND m.doc_date >= ? GROUP BY m.item_id`,
+    since,
+  );
+  const reversed = all<{ item_id: number; units: number }>(
+    db,
+    `SELECT m.item_id, SUM(m.qty) units FROM stock_moves m JOIN journals j ON j.id = m.journal_id
+     JOIN journals o ON o.id = j.reverses_id
+     WHERE j.kind = 'REVERSAL' AND o.kind = 'SALE' AND m.doc_date >= ? GROUP BY m.item_id`,
+    since,
+  );
+  return itemsOverview(db)
+    .map((i) => {
+      const sold30 = Math.max(0, (sold.find((s) => s.item_id === i.id)?.units ?? 0) - (reversed.find((s) => s.item_id === i.id)?.units ?? 0));
+      const perDay = sold30 / 30;
+      const daysCover = perDay > 0 ? i.qty / perDay : null;
+      const suggested = perDay > 0 ? Math.max(0, Math.ceil(perDay * target - i.qty)) : 0;
+      const status: ReorderRow["status"] =
+        daysCover === null ? "slow" : daysCover < lead ? "critical" : daysCover < lead * 2 ? "low" : "healthy";
+      return { id: i.id, sku: i.sku, name: i.name, unit: i.unit, qty: i.qty, value: i.value, sold30, perDay, daysCover, suggested, status };
+    })
+    .sort((a, b) => (a.daysCover ?? Infinity) - (b.daysCover ?? Infinity));
+}
