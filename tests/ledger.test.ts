@@ -131,3 +131,102 @@ test("adjustments need a reason and post to shrinkage", () => {
   assert.equal(trialBalance(db).rows.find((r) => r.code === "5100")!.balance, 250);
   assert.ok(verifyLedger(db).ok);
 });
+
+// ───────────────────────── v2: VAT, FX, year-end, budgets, analytics ─────────────────────────
+import { openForeignInvoices, setBudget, settleForeignInvoice, toEur, vatPosition } from "../lib/ledger.ts";
+import { budgetVsActual, fifoComparison, incomeStatement, vatReport } from "../lib/reports.ts";
+import { detectAnomalies, forecastCash, forecastDemand } from "../lib/analytics.ts";
+
+test("VAT: input on purchases, output on sales, settled to zero", () => {
+  const { db, a, item } = setup();
+  postCash(db, { docDate: "2026-01-01", type: "CAPITAL", amount: 100000, counterparty: "Owner" });
+  postReceipt(db, { docDate: "2026-01-02", warehouseId: a, supplier: "S", lines: [{ itemId: item, qty: 10, unitCost: 1000, vatRate: 19 }] });
+  postSale(db, { docDate: "2026-01-03", warehouseId: a, customer: "C", lines: [{ itemId: item, qty: 4, unitPrice: 2500, vatRate: 7 }] });
+  assert.equal(positionOf(db, item, a).value, 6000); // inventory is net of VAT
+  assert.deepEqual(vatPosition(db), { output: 700, input: 1900, net: -1200 });
+  const r = vatReport(db, { from: "2026-01-01", asOf: "2026-01-31" });
+  assert.equal(r.net, -1200);
+  postCash(db, { docDate: "2026-01-10", type: "PAY_VAT", amount: 0, counterparty: "" });
+  assert.deepEqual(vatPosition(db), { output: 0, input: 0, net: 0 });
+  assert.ok(trialBalance(db).balanced && verifyLedger(db).ok);
+});
+
+test("FX: exact conversion, and realised gain/loss on settlement", () => {
+  const { db, a, item } = setup();
+  assert.equal(toEur(100000, "USD", "0.92"), 92000);
+  assert.equal(toEur(12345, "JPY", "0.0061"), 7530); // ¥12,345 × 0.0061 = €75.30
+  postCash(db, { docDate: "2026-01-01", type: "CAPITAL", amount: 500000, counterparty: "Owner" });
+  const inv = postReceipt(db, { docDate: "2026-01-02", warehouseId: a, supplier: "Kalita", currency: "USD", fxRate: "0.9200", lines: [{ itemId: item, qty: 100, unitCost: 1000 }] });
+  assert.equal(positionOf(db, item, a).value, 92000);
+  assert.throws(() => postReceipt(db, { docDate: "2026-01-02", warehouseId: a, supplier: "K", currency: "USD", fxRate: "0.9", lines: [{ itemId: item, qty: 1, unitCost: 1, vatRate: 19 }] }), /import/);
+  assert.equal(openForeignInvoices(db).length, 1);
+  settleForeignInvoice(db, { docDate: "2026-01-20", receiptId: inv.id, fxRate: "0.9500" });
+  assert.equal(openForeignInvoices(db).length, 0);
+  assert.equal(trialBalance(db).rows.find((r) => r.code === "6900")!.balance, 3000); // paid €950 for a €920 payable
+  assert.equal(trialBalance(db).rows.find((r) => r.code === "2000")!.balance, 0);
+  assert.throws(() => reverseJournal(db, { journalId: inv.id, docDate: "2026-01-21", reason: "x" }), /paid by/);
+  assert.equal(incomeStatement(db, { from: "2026-01-01", asOf: "2026-01-31" }).otherNet, -3000);
+  assert.ok(verifyLedger(db).ok);
+});
+
+test("year-end close moves profit to retained earnings and keeps the P&L clean", () => {
+  const { db, a, item } = setup();
+  postCash(db, { docDate: "2025-11-01", type: "CAPITAL", amount: 100000, counterparty: "Owner" });
+  postReceipt(db, { docDate: "2025-11-02", warehouseId: a, supplier: "S", paid: true, lines: [{ itemId: item, qty: 10, unitCost: 1000 }] });
+  postSale(db, { docDate: "2025-12-05", warehouseId: a, customer: "C", paid: true, lines: [{ itemId: item, qty: 4, unitPrice: 2500 }] });
+  closePeriod(db, "2025-11", "t");
+  const r = closePeriod(db, "2025-12", "t");
+  assert.ok(r.closingId);
+  const tb = trialBalance(db);
+  assert.equal(tb.rows.find((x) => x.code === "4000")!.balance, 0);
+  assert.equal(tb.rows.find((x) => x.code === "3100")!.balance, 6000); // 10,000 revenue − 4,000 COGS
+  assert.equal(incomeStatement(db, { from: "2025-12-01", asOf: "2025-12-31" }).netIncome, 6000);
+  assert.ok(balanceSheet(db).balanced);
+  assert.throws(() => reverseJournal(db, { journalId: r.closingId!, docDate: "2026-01-02", reason: "x" }), /closed|sealed/);
+  const v = verifyLedger(db);
+  assert.ok(v.ok, JSON.stringify(v.checks.filter((c) => !c.ok)));
+});
+
+test("budgets are versioned: latest wins, history kept, unchanged values skipped", () => {
+  const { db } = setup();
+  assert.equal(setBudget(db, [{ period: "2026-01", account: "4000", amount: 100000 }], "t"), 1);
+  assert.equal(setBudget(db, [{ period: "2026-01", account: "4000", amount: 100000 }], "t"), 0);
+  setBudget(db, [{ period: "2026-01", account: "4000", amount: 120000 }], "t");
+  const b = budgetVsActual(db, "2026");
+  assert.equal(b.rows[0].cells[0].budget, 120000);
+  assert.equal(b.history.length, 2);
+  assert.throws(() => setBudget(db, [{ period: "2026-01", account: "1000", amount: 1 }], "t"), /revenue and expense/);
+});
+
+test("FIFO comparison differs from moving average when costs change", () => {
+  const { db, a, item } = setup();
+  postReceipt(db, { docDate: "2026-01-02", warehouseId: a, supplier: "S", lines: [{ itemId: item, qty: 10, unitCost: 100 }] });
+  postReceipt(db, { docDate: "2026-01-03", warehouseId: a, supplier: "S", lines: [{ itemId: item, qty: 10, unitCost: 200 }] });
+  postSale(db, { docDate: "2026-01-04", warehouseId: a, customer: "C", lines: [{ itemId: item, qty: 10, unitPrice: 500 }] });
+  const f = fifoComparison(db);
+  assert.equal(f.fifoCogs, 1000); // oldest layer
+  assert.equal(f.avgCogs, 1500); // average 150
+  assert.equal(f.fifoValue, 2000);
+  assert.equal(f.avgValue, 1500);
+});
+
+test("anomaly detection flags a cost spike, a below-cost sale and a large write-off", () => {
+  const { db, a, item } = setup();
+  postCash(db, { docDate: "2026-01-01", type: "CAPITAL", amount: 9_000_000, counterparty: "Owner" });
+  for (let d = 2; d <= 7; d++) postReceipt(db, { docDate: `2026-01-0${d}`, warehouseId: a, supplier: "S", lines: [{ itemId: item, qty: 10, unitCost: 1000 + d }] });
+  postReceipt(db, { docDate: "2026-01-08", warehouseId: a, supplier: "S", lines: [{ itemId: item, qty: 10, unitCost: 1500 }] });
+  postSale(db, { docDate: "2026-01-09", warehouseId: a, customer: "Cheap Co", lines: [{ itemId: item, qty: 5, unitPrice: 500 }] });
+  postAdjustment(db, { docDate: "2026-01-10", warehouseId: a, memo: "Flood", lines: [{ itemId: item, qtyDelta: -40 }] });
+  const types = detectAnomalies(db).map((x) => x.type);
+  for (const t of ["cost_spike", "below_cost_sale", "shrinkage"]) assert.ok(types.includes(t as never), `missing ${t}: ${types}`);
+});
+
+test("forecasts produce finite, non-negative projections", () => {
+  const { db, a, item } = setup();
+  postCash(db, { docDate: "2026-01-01", type: "CAPITAL", amount: 100000, counterparty: "Owner" });
+  postReceipt(db, { docDate: "2026-01-02", warehouseId: a, supplier: "S", paid: true, lines: [{ itemId: item, qty: 50, unitCost: 100 }] });
+  const d = forecastDemand(db)[0];
+  assert.ok(Number.isFinite(d.forecast30) && d.forecast30 >= 0);
+  const c = forecastCash(db);
+  assert.ok(Number.isFinite(c.projected) && c.points.length > 30);
+});

@@ -14,8 +14,9 @@ export type ActionResult = { ok: true; id: number } | { ok: false; error: string
 
 type Common = { docDate: string; reference?: string; memo?: string; idempotencyKey: string };
 export type TxPayload =
-  | (Common & { kind: "RECEIPT"; warehouseId: number; counterparty: string; paid: boolean; lines: { itemId: number; qty: number; amount: number }[] })
-  | (Common & { kind: "SALE"; warehouseId: number; counterparty: string; paid: boolean; lines: { itemId: number; qty: number; amount: number }[] })
+  | (Common & { kind: "RECEIPT"; warehouseId: number; counterparty: string; paid: boolean; currency?: string; fxRate?: string; lines: { itemId: number; qty: number; amount: number; vatRate?: number }[] })
+  | (Common & { kind: "SALE"; warehouseId: number; counterparty: string; paid: boolean; lines: { itemId: number; qty: number; amount: number; vatRate?: number }[] })
+  | (Common & { kind: "SETTLE_FX"; receiptId: number; fxRate: string })
   | (Common & { kind: "TRANSFER"; warehouseId: number; toWarehouseId: number; lines: { itemId: number; qty: number }[] })
   | (Common & { kind: "ADJUSTMENT"; warehouseId: number; lines: { itemId: number; qty: number; amount?: number }[] })
   | (Common & { kind: "PAYMENT"; cashType: CashType; amount: number; counterparty: string });
@@ -36,10 +37,10 @@ export async function postTransaction(p: TxPayload): Promise<ActionResult> {
     let j;
     switch (p.kind) {
       case "RECEIPT":
-        j = postReceipt(db, { ...base, warehouseId: p.warehouseId, supplier: p.counterparty, paid: p.paid, lines: p.lines.map((l) => ({ itemId: l.itemId, qty: l.qty, unitCost: l.amount })) });
+        j = postReceipt(db, { ...base, warehouseId: p.warehouseId, supplier: p.counterparty, paid: p.paid, currency: p.currency, fxRate: p.fxRate, lines: p.lines.map((l) => ({ itemId: l.itemId, qty: l.qty, unitCost: l.amount, vatRate: l.vatRate })) });
         break;
       case "SALE":
-        j = postSale(db, { ...base, warehouseId: p.warehouseId, customer: p.counterparty, paid: p.paid, lines: p.lines.map((l) => ({ itemId: l.itemId, qty: l.qty, unitPrice: l.amount })) });
+        j = postSale(db, { ...base, warehouseId: p.warehouseId, customer: p.counterparty, paid: p.paid, lines: p.lines.map((l) => ({ itemId: l.itemId, qty: l.qty, unitPrice: l.amount, vatRate: l.vatRate })) });
         break;
       case "TRANSFER":
         j = postTransfer(db, { ...base, fromWarehouseId: p.warehouseId, toWarehouseId: p.toWarehouseId, lines: p.lines });
@@ -49,6 +50,9 @@ export async function postTransaction(p: TxPayload): Promise<ActionResult> {
         break;
       case "PAYMENT":
         j = postCash(db, { ...base, type: p.cashType, amount: p.amount, counterparty: p.counterparty });
+        break;
+      case "SETTLE_FX":
+        j = settleForeignInvoice(db, { ...base, receiptId: p.receiptId, fxRate: p.fxRate });
         break;
     }
     revalidatePath("/", "layout");
@@ -81,7 +85,7 @@ export async function closePeriodAction(period: string): Promise<ActionResult> {
   }
 }
 
-export async function createItemAction(input: { sku: string; name: string; category: string; unit: string }): Promise<ActionResult> {
+export async function createItemAction(input: { sku: string; name: string; category: string; unit: string; vatRate?: number }): Promise<ActionResult> {
   const db = getDb();
   try {
     const id = createItem(db, input, ACTOR);
@@ -93,7 +97,28 @@ export async function createItemAction(input: { sku: string; name: string; categ
 }
 
 import type { AssistantReply, ChatTurn } from "./assistant";
-import { askLedger } from "./assistant";
+import { askLedger, generateCommentary } from "./assistant";
+import { setBudget, settleForeignInvoice } from "./ledger";
+
+export async function generateCommentaryAction(period: string): Promise<{ ok: true; notice?: string } | { ok: false; error: string }> {
+  if (!/^\d{4}-\d{2}$/.test(period)) return { ok: false, error: "Invalid period." };
+  const db = getDb();
+  const c = await generateCommentary(db, period);
+  audit(db, ACTOR, "COMMENTARY_WRITTEN", `${period} by ${c.source} (data ${c.data_hash.slice(0, 12)}…)`);
+  revalidatePath("/", "layout");
+  return { ok: true, notice: c.notice };
+}
+
+export async function saveBudgetAction(entries: { period: string; account: string; amount: number }[]): Promise<ActionResult> {
+  const db = getDb();
+  try {
+    const n = setBudget(db, entries, ACTOR);
+    revalidatePath("/", "layout");
+    return { ok: true, id: n };
+  } catch (e) {
+    return fail(db, "Budget", e);
+  }
+}
 
 export async function askAssistant(history: ChatTurn[]): Promise<AssistantReply> {
   const clean = history

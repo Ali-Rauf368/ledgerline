@@ -126,7 +126,30 @@ export function verifyLedger(db: DB) {
     });
   }
 
-  // 7. Reversals well-formed
+  // 7. Year-end closes zeroed the P&L
+  {
+    const years = all<{ period: string }>(db, "SELECT period FROM period_closes WHERE period LIKE '%-12' ORDER BY period");
+    const bad: string[] = [];
+    for (const y of years) {
+      const left = all<{ code: string; bal: number }>(
+        db,
+        `SELECT l.account_code code, SUM(l.debit - l.credit) bal FROM journal_lines l JOIN journals j ON j.id = l.journal_id
+         JOIN accounts a ON a.code = l.account_code WHERE j.doc_date <= ? AND a.type IN ('REVENUE','EXPENSE')
+         GROUP BY l.account_code HAVING bal <> 0`,
+        `${y.period.slice(0, 4)}-12-31`,
+      );
+      if (left.length) bad.push(`FY${y.period.slice(0, 4)} (${left.map((x) => x.code).join(", ")})`);
+    }
+    checks.push({
+      id: "yearend",
+      label: "Closed years carried to retained earnings",
+      description: "After each year-end close, every revenue and expense account is zero at 31 December.",
+      ok: !bad.length,
+      detail: bad.length ? `Non-zero P&L in ${bad.join(", ")}` : years.length ? `${years.length} fiscal year(s) closed` : "No fiscal year closed yet",
+    });
+  }
+
+  // 8. Reversals well-formed
   {
     const ids = new Map(journals.map((j) => [j.id, j]));
     const bad = journals.filter((j) => {

@@ -2,7 +2,8 @@ import Link from "next/link";
 import { CheckCircle2, Clock, Download, XCircle } from "lucide-react";
 import { Card, CardHeader, Money, PageHeader } from "@/components/ui";
 import type { AccountRow } from "@/lib/reports";
-import { balanceSheet, incomeStatement, inventoryValuation, trialBalance } from "@/lib/reports";
+import { balanceSheet, fifoComparison, fxActivity, incomeStatement, inventoryValuation, trialBalance, vatReport } from "@/lib/reports";
+import { openForeignInvoices, vatPosition } from "@/lib/ledger";
 import { getDb } from "@/lib/db";
 import { today } from "@/lib/ledger";
 import { fmtDate, fmtMoney, fmtPct, fmtQty, fmtTimestamp } from "@/lib/money";
@@ -12,7 +13,11 @@ const TABS = [
   { id: "bs", label: "Balance sheet" },
   { id: "tb", label: "Trial balance" },
   { id: "inv", label: "Inventory valuation" },
+  { id: "vat", label: "VAT return" },
+  { id: "fx", label: "Foreign currency" },
+  { id: "fifo", label: "FIFO vs average" },
 ] as const;
+const EXPORTABLE = ["pl", "bs", "tb", "inv"];
 type TabId = (typeof TABS)[number]["id"];
 
 type SP = { tab?: string; from?: string; asOf?: string; knownAt?: string };
@@ -36,7 +41,7 @@ export default async function ReportsPage({ searchParams }: { searchParams: Prom
         title="Reports"
         subtitle="Generated live from the journal. Pick any accounting date, and optionally a moment in time, to see the report exactly as it would have looked then."
         actions={
-          <a className="btn-ghost" href={`/api/export?${new URLSearchParams(Object.entries({ report: tab, from: tab === "pl" ? from : "", asOf, knownAt: knownAtInput }).filter(([, v]) => v) as [string, string][])}`}>
+          EXPORTABLE.includes(tab) && <a className="btn-ghost" href={`/api/export?${new URLSearchParams(Object.entries({ report: tab, from: tab === "pl" ? from : "", asOf, knownAt: knownAtInput }).filter(([, v]) => v) as [string, string][])}`}>
             <Download className="size-4" /> Export CSV
           </a>
         }
@@ -53,14 +58,14 @@ export default async function ReportsPage({ searchParams }: { searchParams: Prom
       <Card className="mb-6 p-4">
         <form className="grid items-end gap-3 sm:grid-cols-2 lg:grid-cols-[repeat(3,minmax(0,1fr))_auto]">
           <input type="hidden" name="tab" value={tab} />
-          {tab === "pl" && (
+          {(tab === "pl" || tab === "vat" || tab === "fifo") && (
             <div>
               <label className="label" htmlFor="from">From</label>
               <input id="from" name="from" type="date" defaultValue={from} className="field" />
             </div>
           )}
           <div>
-            <label className="label" htmlFor="asOf">{tab === "pl" ? "To" : "As of"}</label>
+            <label className="label" htmlFor="asOf">{tab === "pl" || tab === "vat" || tab === "fifo" ? "To" : "As of"}</label>
             <input id="asOf" name="asOf" type="date" defaultValue={asOf} className="field" />
           </div>
           <div>
@@ -83,6 +88,9 @@ export default async function ReportsPage({ searchParams }: { searchParams: Prom
       {tab === "bs" && <BalanceSheet asOf={asOf} knownAt={knownAt} />}
       {tab === "tb" && <TrialBalance asOf={asOf} knownAt={knownAt} />}
       {tab === "inv" && <Valuation asOf={asOf} knownAt={knownAt} />}
+      {tab === "vat" && <Vat from={from} asOf={asOf} />}
+      {tab === "fx" && <Fx />}
+      {tab === "fifo" && <Fifo from={from} asOf={asOf} />}
     </>
   );
 
@@ -96,6 +104,8 @@ export default async function ReportsPage({ searchParams }: { searchParams: Prom
           <Section title="Cost of sales" rows={r.costOfSales} total={r.totalCostOfSales} negative />
           <Total label="Gross profit" value={r.grossProfit} note={`margin ${fmtPct(r.grossMargin)}`} />
           <Section title="Operating expenses" rows={r.opex} total={r.totalOpex} negative />
+          <Total label="Operating income" value={r.operatingIncome} />
+          {r.other.some((x) => x.balance) && <Section title="Other income & expense" rows={r.other} total={r.otherNet} totalLabel="Net other income" />}
           <Total label="Net income" value={r.netIncome} strong />
         </div>
       </Card>
@@ -193,6 +203,129 @@ export default async function ReportsPage({ searchParams }: { searchParams: Prom
       </Card>
     );
   }
+  function Vat({ from, asOf }: { from: string; asOf: string }) {
+    const r = vatReport(db, { from, asOf });
+    const now = vatPosition(db);
+    return (
+      <div className="grid gap-6 lg:grid-cols-[1fr_340px]">
+        <Card>
+          <CardHeader title="VAT return" subtitle={`${fmtDate(from)} to ${fmtDate(asOf)}. Output VAT on sales minus input VAT on purchases.`} />
+          <div className="grid gap-3 p-5 sm:grid-cols-3">
+            <Kpi label="Output VAT (sales)" value={r.output} />
+            <Kpi label="Input VAT (purchases)" value={r.input} />
+            <Kpi label={r.net >= 0 ? "Net payable" : "Net refundable"} value={Math.abs(r.net)} tone={r.net >= 0 ? "neg" : "pos"} />
+          </div>
+          <div className="border-t border-line px-5 py-4 text-sm text-muted">
+            Net sales in the period: <Money cents={r.taxableSales} className="font-medium text-ink" /> · effective output rate {fmtPct(r.effectiveRate)} (mix of 7% coffee and 19% goods).
+          </div>
+          {r.settlements.length > 0 && (
+            <table className="table">
+              <thead><tr><th>Settlement</th><th>Date</th><th className="text-right!">Paid (−refund)</th></tr></thead>
+              <tbody>{r.settlements.map((x) => <tr key={x.id}><td><Link className="text-accent" href={`/transactions/${x.id}`}>#{x.id}</Link></td><td>{fmtDate(x.doc_date)}</td><td className="text-right"><Money cents={x.amount} /></td></tr>)}</tbody>
+            </table>
+          )}
+        </Card>
+        <Card className="p-5">
+          <h2 className="text-sm font-semibold">Current position</h2>
+          <dl className="mt-4 space-y-2 text-sm">
+            <div className="flex justify-between"><dt className="text-muted">Output VAT owed</dt><dd><Money cents={now.output} /></dd></div>
+            <div className="flex justify-between"><dt className="text-muted">Input VAT reclaimable</dt><dd><Money cents={now.input} /></dd></div>
+            <div className="flex justify-between border-t border-line pt-2 font-semibold"><dt>{now.net >= 0 ? "To pay" : "To reclaim"}</dt><dd><Money cents={Math.abs(now.net)} /></dd></div>
+          </dl>
+          <Link href="/transactions/new" className="btn-primary mt-5 w-full">Settle VAT</Link>
+          <p className="mt-2 text-center text-[11px] text-muted">New transaction → Cash → Settle VAT</p>
+        </Card>
+      </div>
+    );
+  }
+
+  function Fx() {
+    const open = openForeignInvoices(db);
+    const f = fxActivity(db);
+    return (
+      <div className="space-y-6">
+        <Card>
+          <CardHeader title="Open foreign-currency invoices" subtitle="Booked at the invoice-date rate. Paying at a different rate realises an FX gain or loss." />
+          {open.length === 0 ? <p className="px-5 py-6 text-sm text-muted">No open foreign invoices.</p> : (
+            <div className="overflow-x-auto">
+              <table className="table min-w-[640px]">
+                <thead><tr><th>Invoice</th><th>Supplier</th><th className="text-right!">Amount</th><th className="text-right!">Booked rate</th><th className="text-right!">Booked EUR</th></tr></thead>
+                <tbody>{open.map((o) => (
+                  <tr key={o.id}>
+                    <td><Link className="text-accent" href={`/transactions/${o.id}`}>#{o.id}</Link> <span className="text-xs text-muted">{fmtDate(o.doc_date)}</span></td>
+                    <td>{o.counterparty}</td>
+                    <td className="num text-right">{(o.foreign_amount / (o.currency === "JPY" ? 1 : 100)).toLocaleString("en-IE", { minimumFractionDigits: o.currency === "JPY" ? 0 : 2 })} {o.currency}</td>
+                    <td className="num text-right text-muted">{o.fx_rate}</td>
+                    <td className="text-right"><Money cents={o.eur_amount} /></td>
+                  </tr>))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+        <Card>
+          <CardHeader title="Settled invoices" subtitle={<>Net realised FX result: <Money cents={f.netGain} colored className="font-semibold" /></>} />
+          <div className="overflow-x-auto">
+            <table className="table min-w-[640px]">
+              <thead><tr><th>Payment</th><th>Supplier</th><th className="text-right!">Amount</th><th className="text-right!">Booked → paid rate</th><th className="text-right!">Gain / loss</th></tr></thead>
+              <tbody>{f.settled.map((x) => (
+                <tr key={x.id}>
+                  <td><Link className="text-accent" href={`/transactions/${x.id}`}>#{x.id}</Link> <span className="text-xs text-muted">for #{x.settles_id}</span></td>
+                  <td>{x.counterparty}</td>
+                  <td className="num text-right">{(x.foreign_amount / 100).toFixed(2)} {x.currency}</td>
+                  <td className="num text-right text-muted">{x.booked_rate} → {x.fx_rate}</td>
+                  <td className="text-right"><Money cents={x.gain} colored /></td>
+                </tr>))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      </div>
+    );
+  }
+
+  function Fifo({ from, asOf }: { from: string; asOf: string }) {
+    const r = fifoComparison(db, { from, asOf });
+    return (
+      <Card>
+        <CardHeader title="FIFO vs moving average" subtitle="The ledger values stock at moving average. This replays every movement through FIFO layers for comparison. Sales COGS covers the selected range; values are as of the end date." />
+        <div className="grid gap-3 p-5 sm:grid-cols-4">
+          <Kpi label="Inventory · FIFO" value={r.fifoValue} />
+          <Kpi label="Inventory · moving avg" value={r.avgValue} />
+          <Kpi label="COGS in range · FIFO" value={r.fifoCogs} />
+          <Kpi label="COGS in range · moving avg" value={r.avgCogs} />
+        </div>
+        <p className="px-5 pb-4 text-sm text-muted">
+          With rising purchase costs, FIFO charges older (cheaper) layers to COGS: profit would be <Money cents={r.avgCogs - r.fifoCogs} colored className="font-medium" /> different in this range.
+        </p>
+        <div className="overflow-x-auto">
+          <table className="table min-w-[720px]">
+            <thead><tr><th>Item</th><th className="text-right!">Qty</th><th className="text-right!">FIFO value</th><th className="text-right!">Avg value</th><th className="text-right!">Difference</th><th className="text-right!">COGS FIFO</th><th className="text-right!">COGS avg</th></tr></thead>
+            <tbody>{r.rows.map((x) => (
+              <tr key={x.id}>
+                <td><span className="font-mono text-xs text-muted">{x.sku}</span> {x.name}</td>
+                <td className="num text-right">{x.qty}</td>
+                <td className="text-right"><Money cents={x.fifoValue} /></td>
+                <td className="text-right"><Money cents={x.avgValue} /></td>
+                <td className="text-right"><Money cents={x.diff} colored /></td>
+                <td className="text-right text-muted"><Money cents={x.fifoCogs} /></td>
+                <td className="text-right text-muted"><Money cents={x.avgCogs} /></td>
+              </tr>))}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+    );
+  }
+}
+
+function Kpi({ label, value, tone }: { label: string; value: number; tone?: "pos" | "neg" }) {
+  return (
+    <div className="rounded-xl bg-surface-2/70 p-4">
+      <p className="text-xs text-muted">{label}</p>
+      <Money cents={value} className={`mt-1 block text-xl font-semibold ${tone === "pos" ? "text-pos" : tone === "neg" ? "text-neg" : ""}`} />
+    </div>
+  );
 }
 
 function Section({ title, rows, total, negative, totalLabel }: { title?: string; rows: AccountRow[]; total: number; negative?: boolean; totalLabel?: string }) {

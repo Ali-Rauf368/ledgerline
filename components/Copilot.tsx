@@ -3,19 +3,19 @@
 import { Fragment, useEffect, useRef, useState, useTransition } from "react";
 import type { ReactNode } from "react";
 import Link from "next/link";
-import { ArrowUp, Bot, Eraser, Sparkles, Wrench, X } from "lucide-react";
+import { ArrowUp, Bot, Eraser, FilePen, Sparkles, Wrench, X } from "lucide-react";
 import type { AssistantReply, ChatTurn } from "@/lib/assistant";
 import { askAssistant } from "@/lib/actions";
 
-type Msg = ChatTurn & { tools?: string[]; notice?: string; mode?: AssistantReply["mode"] };
+type Msg = ChatTurn & { tools?: string[]; notice?: string; mode?: AssistantReply["mode"]; drafts?: AssistantReply["drafts"] };
 
 const SUGGESTIONS = [
-  "What should I reorder this week?",
-  "How did last month compare to the month before?",
+  "Anything unusual in the books?",
+  "Forecast cash and stock-outs for the next 30 days",
+  "How are we tracking against budget?",
+  "What's our VAT position?",
+  "Sell 3 ETH-YRG-1K to Café Kranich at 26.90",
   "Is the ledger intact?",
-  "Show the latest reversals and why they happened",
-  "What's my cash position?",
-  "Which items carry the most value?",
 ];
 
 const STORAGE_KEY = "ledgerline.copilot.v1";
@@ -79,7 +79,7 @@ export function Copilot() {
     start(async () => {
       try {
         const r = await askAssistant(next.map(({ role, text }) => ({ role, text })));
-        setMsgs((m) => [...m, { role: "assistant", text: r.text, tools: r.tools, notice: r.notice, mode: r.mode }]);
+        setMsgs((m) => [...m, { role: "assistant", text: r.text, tools: r.tools, notice: r.notice, mode: r.mode, drafts: r.drafts }]);
       } catch {
         setMsgs((m) => [...m, { role: "assistant", text: "Something went wrong reaching the assistant. Please try again.", mode: "offline" }]);
       }
@@ -133,7 +133,7 @@ export function Copilot() {
               </div>
               <p className="mt-3 text-center text-sm font-medium text-ink">Ask anything about your books</p>
               <p className="mx-auto mt-1 max-w-[280px] text-center text-xs text-muted">
-                Copilot looks up real figures with read-only tools. It can explain, but never change, the ledger.
+                Copilot looks up real figures, spots anomalies, forecasts, and drafts entries for you to review. It never posts on its own.
               </p>
               <div className="mt-5 flex flex-wrap justify-center gap-2">
                 {SUGGESTIONS.map((s) => (
@@ -164,6 +164,11 @@ export function Copilot() {
                   <div className="rounded-2xl rounded-tl-md bg-surface-2 px-3.5 py-2.5 text-sm leading-relaxed text-ink">
                     <RichText text={m.text} />
                   </div>
+                  {m.drafts?.map((d) => (
+                    <Link key={d.href} href={d.href} onClick={() => setOpen(false)} className="mt-2 flex items-center gap-2 rounded-xl border border-accent/30 bg-accent-soft px-3 py-2 text-xs font-medium text-accent transition hover:border-accent">
+                      <FilePen className="size-3.5" /> Review &amp; post draft: <span className="truncate font-normal">{d.label}</span>
+                    </Link>
+                  ))}
                   {m.notice && <p className="mt-1.5 text-[11px] text-warn">{m.notice}</p>}
                 </div>
               </div>

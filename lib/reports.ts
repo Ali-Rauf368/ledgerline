@@ -6,7 +6,7 @@
  */
 import type { DB } from "./db.ts";
 import { all, get } from "./db.ts";
-import { ACC, COST_OF_SALES, isDebitNormal } from "./accounts.ts";
+import { ACC, COST_OF_SALES, OTHER_PNL, isDebitNormal } from "./accounts.ts";
 import type { AccountType, JournalKind } from "./accounts.ts";
 import { lockedThrough, monthEnd, nextClosablePeriod, nextMonth, today } from "./ledger.ts";
 
@@ -14,7 +14,7 @@ const MIN_DATE = "0000-01-01";
 const MAX_DATE = "9999-12-31";
 const MAX_TS = "9999-12-31T23:59:59.999Z";
 
-export type Filter = { from?: string; asOf?: string; knownAt?: string };
+export type Filter = { from?: string; asOf?: string; knownAt?: string; excludeClosing?: boolean };
 
 export type AccountRow = { code: string; name: string; type: AccountType; debit: number; credit: number; balance: number };
 
@@ -25,13 +25,14 @@ export function accountActivity(db: DB, f: Filter = {}): AccountRow[] {
      FROM accounts a LEFT JOIN (
        SELECT l.account_code, SUM(l.debit) debit, SUM(l.credit) credit
        FROM journal_lines l JOIN journals j ON j.id = l.journal_id
-       WHERE j.doc_date >= ? AND j.doc_date <= ? AND j.posted_at <= ?
+       WHERE j.doc_date >= ? AND j.doc_date <= ? AND j.posted_at <= ? AND (? = 0 OR j.kind <> 'CLOSING')
        GROUP BY l.account_code
      ) s ON s.account_code = a.code
      ORDER BY a.code`,
     f.from ?? MIN_DATE,
     f.asOf ?? MAX_DATE,
     f.knownAt ?? MAX_TS,
+    f.excludeClosing ? 1 : 0,
   );
   return rows.map((r) => ({ ...r, balance: isDebitNormal(r.type) ? r.debit - r.credit : r.credit - r.debit }));
 }
@@ -50,25 +51,31 @@ export function trialBalance(db: DB, f: Filter = {}) {
   return { rows, totals, balanced: totals.debit === totals.credit };
 }
 
+/** Year-end closing entries are excluded: they move profit to equity and are not performance. */
 export function incomeStatement(db: DB, f: Filter = {}) {
-  const rows = accountActivity(db, f);
-  const revenue = rows.filter((r) => r.type === "REVENUE");
+  const rows = accountActivity(db, { ...f, excludeClosing: true });
+  const revenue = rows.filter((r) => r.type === "REVENUE" && !OTHER_PNL.includes(r.code));
   const costOfSales = rows.filter((r) => COST_OF_SALES.includes(r.code));
-  const opex = rows.filter((r) => r.type === "EXPENSE" && !COST_OF_SALES.includes(r.code));
+  const opex = rows.filter((r) => r.type === "EXPENSE" && !COST_OF_SALES.includes(r.code) && !OTHER_PNL.includes(r.code));
+  const other = rows.filter((r) => OTHER_PNL.includes(r.code));
   const sum = (xs: AccountRow[]) => xs.reduce((s, r) => s + r.balance, 0);
   const totalRevenue = sum(revenue);
   const grossProfit = totalRevenue - sum(costOfSales);
-  const netIncome = grossProfit - sum(opex);
+  const operatingIncome = grossProfit - sum(opex);
+  const otherNet = other.reduce((s, r) => s + (r.type === "REVENUE" ? r.balance : -r.balance), 0);
   return {
     revenue,
     costOfSales,
     opex,
+    other: other.map((r) => ({ ...r, balance: r.type === "REVENUE" ? r.balance : -r.balance })),
     totalRevenue,
     totalCostOfSales: sum(costOfSales),
     totalOpex: sum(opex),
     grossProfit,
     grossMargin: totalRevenue ? grossProfit / totalRevenue : 0,
-    netIncome,
+    operatingIncome,
+    otherNet,
+    netIncome: operatingIncome + otherNet,
   };
 }
 
@@ -77,7 +84,7 @@ export function balanceSheet(db: DB, f: Filter = {}) {
   const by = (t: AccountType) => rows.filter((r) => r.type === t);
   const sum = (xs: { balance: number }[]) => xs.reduce((s, r) => s + r.balance, 0);
   const netIncome = sum(by("REVENUE")) - sum(by("EXPENSE"));
-  const equity = [...by("EQUITY"), { code: "—", name: "Earnings to date", type: "EQUITY" as const, debit: 0, credit: 0, balance: netIncome }];
+  const equity = [...by("EQUITY"), { code: "—", name: "Current-year earnings", type: "EQUITY" as const, debit: 0, credit: 0, balance: netIncome }];
   const totalAssets = sum(by("ASSET"));
   const totalLiabilities = sum(by("LIABILITY"));
   const totalEquity = sum(equity);
@@ -251,7 +258,7 @@ export function monthly(db: DB) {
   const rows = all<{ m: string; code: string; dr: number; cr: number }>(
     db,
     `SELECT substr(j.doc_date, 1, 7) m, l.account_code code, SUM(l.debit) dr, SUM(l.credit) cr
-     FROM journal_lines l JOIN journals j ON j.id = l.journal_id GROUP BY m, code`,
+     FROM journal_lines l JOIN journals j ON j.id = l.journal_id WHERE j.kind <> 'CLOSING' GROUP BY m, code`,
   );
   return monthsBetween(first.slice(0, 7), today().slice(0, 7)).map((m) => {
     const r = (code: string) => rows.find((x) => x.m === m && x.code === code);
@@ -390,4 +397,165 @@ export function reorderInsights(db: DB, o: { leadDays?: number; targetDays?: num
       return { id: i.id, sku: i.sku, name: i.name, unit: i.unit, qty: i.qty, value: i.value, sold30, perDay, daysCover, suggested, status };
     })
     .sort((a, b) => (a.daysCover ?? Infinity) - (b.daysCover ?? Infinity));
+}
+
+// ───────────────────────── VAT ─────────────────────────
+
+/** VAT return for a date range: output VAT on sales, input VAT on purchases, and settlements paid. */
+export function vatReport(db: DB, f: { from: string; asOf: string }) {
+  const sumWhere = (code: string, kindClause: string, sign: 1 | -1) =>
+    get<{ v: number }>(
+      db,
+      `SELECT COALESCE(SUM(l.debit - l.credit), 0) v FROM journal_lines l JOIN journals j ON j.id = l.journal_id
+       WHERE l.account_code = ? AND j.doc_date BETWEEN ? AND ? AND ${kindClause}`,
+      code,
+      f.from,
+      f.asOf,
+    )!.v * sign;
+  // A VAT settlement is a PAYMENT that touches both VAT accounts; everything else is a taxable transaction.
+  const notSettlement = `NOT (j.kind = 'PAYMENT' AND EXISTS (SELECT 1 FROM journal_lines x WHERE x.journal_id = j.id AND x.account_code = '${ACC.VAT_OUT}'))`;
+  const output = sumWhere(ACC.VAT_OUT, notSettlement, -1);
+  const input = sumWhere(ACC.VAT_IN, notSettlement, 1);
+  const settlements = all<{ id: number; doc_date: string; amount: number }>(
+    db,
+    `SELECT j.id, j.doc_date, COALESCE((SELECT SUM(credit - debit) FROM journal_lines WHERE journal_id = j.id AND account_code = ?), 0) amount
+     FROM journals j WHERE j.kind = 'PAYMENT' AND j.doc_date BETWEEN ? AND ?
+       AND EXISTS (SELECT 1 FROM journal_lines x WHERE x.journal_id = j.id AND x.account_code = ?)
+     ORDER BY j.id`,
+    ACC.CASH,
+    f.from,
+    f.asOf,
+    ACC.VAT_OUT,
+  );
+  const taxableSales = -get<{ v: number }>(
+    db,
+    `SELECT COALESCE(SUM(l.debit - l.credit), 0) v FROM journal_lines l JOIN journals j ON j.id = l.journal_id
+     WHERE l.account_code = ? AND j.doc_date BETWEEN ? AND ? AND j.kind <> 'CLOSING'`,
+    ACC.REVENUE,
+    f.from,
+    f.asOf,
+  )!.v;
+  const bal = accountActivity(db, { asOf: f.asOf });
+  const outstanding = bal.find((a) => a.code === ACC.VAT_OUT)!.balance - bal.find((a) => a.code === ACC.VAT_IN)!.balance;
+  return { output, input, net: output - input, settlements, taxableSales, effectiveRate: taxableSales ? output / taxableSales : 0, outstanding };
+}
+
+// ───────────────────────── FX ─────────────────────────
+
+export function fxActivity(db: DB) {
+  const settled = all<{ id: number; doc_date: string; counterparty: string; currency: string; fx_rate: string; foreign_amount: number; settles_id: number; booked_rate: string; gain: number }>(
+    db,
+    `SELECT s.id, s.doc_date, s.counterparty, s.currency, s.fx_rate, s.foreign_amount, s.settles_id, r.fx_rate booked_rate,
+       COALESCE((SELECT SUM(credit - debit) FROM journal_lines WHERE journal_id = s.id AND account_code IN (?, ?)), 0) gain
+     FROM journals s JOIN journals r ON r.id = s.settles_id
+     WHERE NOT EXISTS (SELECT 1 FROM journals x WHERE x.reverses_id = s.id)
+     ORDER BY s.id DESC`,
+    ACC.FX_GAIN,
+    ACC.FX_LOSS,
+  );
+  return { settled, netGain: settled.reduce((t, r) => t + r.gain, 0) };
+}
+
+// ───────────────────────── budgets ─────────────────────────
+
+export const BUDGET_ACCOUNTS = [ACC.REVENUE, ACC.COGS, ACC.OPEX] as const;
+
+export function budgetVsActual(db: DB, year: string) {
+  const latest = all<{ period: string; account_code: string; amount: number }>(
+    db,
+    `SELECT b.period, b.account_code, b.amount FROM budget_entries b
+     WHERE b.period LIKE ? AND b.id = (SELECT MAX(id) FROM budget_entries x WHERE x.period = b.period AND x.account_code = b.account_code)`,
+    `${year}-%`,
+  );
+  const actuals = all<{ m: string; code: string; dr: number; cr: number }>(
+    db,
+    `SELECT substr(j.doc_date, 1, 7) m, l.account_code code, SUM(l.debit) dr, SUM(l.credit) cr
+     FROM journal_lines l JOIN journals j ON j.id = l.journal_id
+     WHERE j.doc_date LIKE ? AND j.kind <> 'CLOSING' GROUP BY m, code`,
+    `${year}-%`,
+  );
+  const months = Array.from({ length: 12 }, (_, i) => `${year}-${String(i + 1).padStart(2, "0")}`);
+  const cur = today().slice(0, 7);
+  const rows = BUDGET_ACCOUNTS.map((code) => {
+    const isRevenue = code === ACC.REVENUE;
+    const cells = months.map((m) => {
+      const a = actuals.find((x) => x.m === m && x.code === code);
+      const actual = a ? (isRevenue ? a.cr - a.dr : a.dr - a.cr) : 0;
+      const budget = latest.find((b) => b.period === m && b.account_code === code)?.amount ?? null;
+      const past = m <= cur;
+      const variance = budget === null || !past ? null : isRevenue ? actual - budget : budget - actual; // positive = favourable
+      return { month: m, actual: past ? actual : null, budget, variance, partial: m === cur };
+    });
+    const ytd = cells.filter((c) => c.actual !== null && c.budget !== null);
+    const ytdActual = ytd.reduce((t, c) => t + (c.actual ?? 0), 0);
+    const ytdBudget = ytd.reduce((t, c) => t + (c.budget ?? 0), 0);
+    return { code, isRevenue, cells, ytdActual, ytdBudget, ytdVariance: isRevenue ? ytdActual - ytdBudget : ytdBudget - ytdActual, fullYearBudget: cells.reduce((t, c) => t + (c.budget ?? 0), 0) };
+  });
+  const history = all<{ period: string; account_code: string; amount: number; created_at: string; created_by: string }>(
+    db,
+    "SELECT period, account_code, amount, created_at, created_by FROM budget_entries WHERE period LIKE ? ORDER BY id DESC LIMIT 20",
+    `${year}-%`,
+  );
+  return { year, months, rows, history };
+}
+
+// ───────────────────────── FIFO comparison ─────────────────────────
+
+/**
+ * Re-values history under FIFO for comparison. The ledger's policy stays moving average; this replays
+ * every stock movement per item (company-wide; transfers net to zero) through FIFO layers.
+ */
+export function fifoComparison(db: DB, f: { from?: string; asOf?: string } = {}) {
+  const from = f.from ?? MIN_DATE;
+  const asOf = f.asOf ?? MAX_DATE;
+  const moves = all<{ item_id: number; qty: number; value: number; doc_date: string; kind: string; orig_kind: string | null }>(
+    db,
+    `SELECT m.item_id, m.qty, m.value, m.doc_date, j.kind, o.kind orig_kind
+     FROM stock_moves m JOIN journals j ON j.id = m.journal_id LEFT JOIN journals o ON o.id = j.reverses_id
+     WHERE m.doc_date <= ? AND j.kind <> 'TRANSFER' AND NOT (j.kind = 'REVERSAL' AND o.kind = 'TRANSFER')
+     ORDER BY m.id`,
+    asOf,
+  );
+  const items = itemsOverview(db);
+  const state = new Map<number, { layers: { qty: number; unit: number }[]; fifoCogs: number; avgCogs: number }>();
+  for (const m of moves) {
+    const st = state.get(m.item_id) ?? { layers: [], fifoCogs: 0, avgCogs: 0 };
+    state.set(m.item_id, st);
+    const isSale = m.kind === "SALE" || (m.kind === "REVERSAL" && m.orig_kind === "SALE");
+    if (m.qty > 0) {
+      st.layers.push({ qty: m.qty, unit: m.value / m.qty });
+      if (isSale && m.doc_date >= from) {
+        st.fifoCogs -= m.value; // sale reversal returns at the cost originally charged
+        st.avgCogs -= m.value;
+      }
+      continue;
+    }
+    let need = -m.qty;
+    let cost = 0;
+    while (need > 0 && st.layers.length) {
+      const l = st.layers[0];
+      const take = Math.min(need, l.qty);
+      cost += take * l.unit;
+      l.qty -= take;
+      need -= take;
+      if (l.qty === 0) st.layers.shift();
+    }
+    if (isSale && m.doc_date >= from) {
+      st.fifoCogs += cost;
+      st.avgCogs += -m.value;
+    }
+  }
+  const rows = items.map((i) => {
+    const st = state.get(i.id);
+    const qty = st ? st.layers.reduce((t, l) => t + l.qty, 0) : 0;
+    const fifoValue = Math.round(st ? st.layers.reduce((t, l) => t + l.qty * l.unit, 0) : 0);
+    const avg = positions(db, { asOf }).filter((p) => p.item_id === i.id);
+    const avgValue = avg.reduce((t, p) => t + p.value, 0);
+    return {
+      id: i.id, sku: i.sku, name: i.name, qty, fifoValue, avgValue, diff: fifoValue - avgValue,
+      fifoCogs: Math.round(st?.fifoCogs ?? 0), avgCogs: Math.round(st?.avgCogs ?? 0),
+    };
+  });
+  const sum = (k: "fifoValue" | "avgValue" | "fifoCogs" | "avgCogs") => rows.reduce((t, r) => t + r[k], 0);
+  return { rows, fifoValue: sum("fifoValue"), avgValue: sum("avgValue"), fifoCogs: sum("fifoCogs"), avgCogs: sum("avgCogs") };
 }

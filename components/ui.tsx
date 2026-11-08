@@ -56,6 +56,7 @@ const KIND_TONE: Record<JournalKind, Tone> = {
   ADJUSTMENT: "warn",
   PAYMENT: "neutral",
   REVERSAL: "neg",
+  CLOSING: "accent",
 };
 
 export function KindBadge({ kind }: { kind: JournalKind }) {

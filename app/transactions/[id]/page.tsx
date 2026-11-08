@@ -22,7 +22,9 @@ export default async function JournalDetailPage({ params }: { params: Promise<{ 
   const hashOk = computeJournalHash(j as never, rawLines, rawMoves) === j.hash;
   const debits = lines.reduce((s, l) => s + l.debit, 0);
   const credits = lines.reduce((s, l) => s + l.credit, 0);
-  const canReverse = j.kind !== "REVERSAL" && !j.reversed_by;
+  const fx = j as unknown as { currency: string | null; fx_rate: string | null; foreign_amount: number | null; settles_id: number | null };
+  const settledBy = all<{ id: number }>(db, "SELECT s.id FROM journals s WHERE s.settles_id = ? AND NOT EXISTS (SELECT 1 FROM journals r WHERE r.reverses_id = s.id)", j.id)[0]?.id;
+  const canReverse = j.kind !== "REVERSAL" && j.kind !== "CLOSING" && !j.reversed_by && !settledBy;
 
   return (
     <>
@@ -117,6 +119,9 @@ export default async function JournalDetailPage({ params }: { params: Promise<{ 
                 ["Document date", fmtDate(j.doc_date)],
                 ["Posted at", fmtTimestamp(j.posted_at)],
                 ["Reference", j.reference || "—"],
+                ...(fx.currency ? [["Currency", `${(fx.foreign_amount! / (fx.currency === "JPY" ? 1 : 100)).toFixed(fx.currency === "JPY" ? 0 : 2)} ${fx.currency} @ ${fx.fx_rate}`]] : []),
+                ...(fx.settles_id ? [["Settles invoice", <Link key="s" href={`/transactions/${fx.settles_id}`} className="text-accent">#{fx.settles_id}</Link>]] : []),
+                ...(settledBy ? [["Paid by", <Link key="p" href={`/transactions/${settledBy}`} className="text-accent">#{settledBy}</Link>]] : []),
                 ["Idempotency key", j.idempotency_key ? <code key="k" className="font-mono text-[11px]">{j.idempotency_key.slice(0, 18)}…</code> : "—"],
               ].map(([k, v]) => (
                 <div key={String(k)} className="flex justify-between gap-4">

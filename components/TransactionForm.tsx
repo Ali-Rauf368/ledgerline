@@ -2,12 +2,13 @@
 
 import { useMemo, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeftRight, Banknote, PackageMinus, PackagePlus, Plus, ShoppingCart, Trash2 } from "lucide-react";
-import { ACC, ACCOUNT_NAME } from "@/lib/accounts";
-import type { JournalKind } from "@/lib/accounts";
+import { ArrowLeftRight, Banknote, Globe2, PackageMinus, PackagePlus, Plus, ShoppingCart, Sparkles, Trash2 } from "lucide-react";
+import { ACC, ACCOUNT_NAME, CURRENCIES, CURRENCY_DECIMALS, VAT_RATES } from "@/lib/accounts";
+import type { Currency } from "@/lib/accounts";
 import type { TxPayload } from "@/lib/actions";
 import { postTransaction } from "@/lib/actions";
-import type { CashType } from "@/lib/ledger";
+import type { TxDraft } from "@/lib/draft";
+import type { CashType, OpenForeignInvoice } from "@/lib/ledger";
 import { fmtMoney, fmtMonth, fmtQty, parseMoney, parseQty } from "@/lib/money";
 import { ErrorNote } from "./forms";
 
@@ -16,32 +17,52 @@ export type ItemOption = {
   sku: string;
   name: string;
   unit: string;
+  vatRate: number;
   byWarehouse: Record<number, { qty: number; value: number }>;
 };
 type Wh = { id: number; code: string; name: string };
-type Kind = Exclude<JournalKind, "REVERSAL">;
-type Row = { key: number; itemId: string; qty: string; amount: string };
+type Kind = "RECEIPT" | "SALE" | "TRANSFER" | "ADJUSTMENT" | "PAYMENT";
+type Row = { key: number; itemId: string; qty: string; amount: string; vat: string };
+type CashMode = CashType | "SETTLE_FX";
 
 const TABS: { kind: Kind; label: string; cta: string; icon: typeof Plus; help: string }[] = [
-  { kind: "RECEIPT", label: "Receive", cta: "Post goods receipt", icon: PackagePlus, help: "Goods arrive from a supplier at a known cost." },
-  { kind: "SALE", label: "Sell", cta: "Post sale", icon: ShoppingCart, help: "Goods leave at moving-average cost, and revenue is recognised." },
+  { kind: "RECEIPT", label: "Receive", cta: "Post goods receipt", icon: PackagePlus, help: "Goods arrive from a supplier. Enter net unit costs; VAT is added per line. Foreign-currency invoices are converted at the rate you enter." },
+  { kind: "SALE", label: "Sell", cta: "Post sale", icon: ShoppingCart, help: "Goods leave at moving-average cost. Revenue is recognised net, and output VAT is added per line." },
   { kind: "TRANSFER", label: "Transfer", cta: "Post transfer", icon: ArrowLeftRight, help: "Move stock between warehouses at cost, with no profit impact." },
   { kind: "ADJUSTMENT", label: "Adjust", cta: "Post adjustment", icon: PackageMinus, help: "Correct quantities after a count, damage or loss." },
-  { kind: "PAYMENT", label: "Cash", cta: "Post cash movement", icon: Banknote, help: "Pay suppliers, collect from customers, pay expenses or add capital." },
+  { kind: "PAYMENT", label: "Cash", cta: "Post cash movement", icon: Banknote, help: "Pay suppliers (including foreign invoices), collect from customers, settle VAT, pay expenses or add capital." },
 ];
 
-const CASH_TYPES: { value: CashType; label: string }[] = [
+const CASH_TYPES: { value: CashMode; label: string }[] = [
   { value: "RECEIVE_CUSTOMER", label: "Receive from customer" },
-  { value: "PAY_SUPPLIER", label: "Pay supplier" },
+  { value: "PAY_SUPPLIER", label: "Pay supplier (EUR)" },
+  { value: "SETTLE_FX", label: "Pay foreign-currency invoice" },
+  { value: "PAY_VAT", label: "Settle VAT with tax office" },
   { value: "EXPENSE", label: "Pay operating expense" },
   { value: "CAPITAL", label: "Owner adds capital" },
 ];
 
 let rowKey = 1;
-const blankRow = (): Row => ({ key: rowKey++, itemId: "", qty: "", amount: "" });
+const blankRow = (): Row => ({ key: rowKey++, itemId: "", qty: "", amount: "", vat: "" });
+
+/** Parse an amount in a currency's major units into minor units (JPY has no decimals). */
+function parseIn(currency: Currency, s: string) {
+  if (CURRENCY_DECIMALS[currency] === 0) return /^\d{1,12}$/.test(s.trim()) ? Number(s.trim()) : null;
+  return parseMoney(s);
+}
+
+/** Client-side estimate only; the server converts with exact integer arithmetic. */
+function estEur(minor: number, currency: Currency, rate: string) {
+  const r = Number(rate);
+  if (!r) return 0;
+  return Math.round((minor / 10 ** CURRENCY_DECIMALS[currency]) * r * 100);
+}
+
+const fmtForeign = (minor: number, c: Currency) =>
+  new Intl.NumberFormat("en-IE", { style: "currency", currency: c }).format(minor / 10 ** CURRENCY_DECIMALS[c]);
 
 export function TransactionForm({
-  items, warehouses, today, lockedThrough, payables, receivables,
+  items, warehouses, today, lockedThrough, payables, receivables, vatNet, openInvoices, draft,
 }: {
   items: ItemOption[];
   warehouses: Wh[];
@@ -49,87 +70,126 @@ export function TransactionForm({
   lockedThrough: string | null;
   payables: number;
   receivables: number;
+  vatNet: number;
+  openInvoices: OpenForeignInvoice[];
+  draft: TxDraft | null;
 }) {
   const router = useRouter();
   const [pending, start] = useTransition();
   const [error, setError] = useState<string | null>(null);
   const key = useRef(crypto.randomUUID());
 
-  const [kind, setKind] = useState<Kind>("RECEIPT");
+  const [kind, setKind] = useState<Kind>(draft?.kind ?? "RECEIPT");
   const [docDate, setDocDate] = useState(today);
-  const [warehouseId, setWarehouseId] = useState(String(warehouses[0]?.id ?? ""));
-  const [toWarehouseId, setToWarehouseId] = useState(String(warehouses[1]?.id ?? warehouses[0]?.id ?? ""));
-  const [counterparty, setCounterparty] = useState("");
-  const [reference, setReference] = useState("");
-  const [memo, setMemo] = useState("");
-  const [paid, setPaid] = useState(false);
-  const [cashType, setCashType] = useState<CashType>("RECEIVE_CUSTOMER");
-  const [cashAmount, setCashAmount] = useState("");
-  const [rows, setRows] = useState<Row[]>([blankRow()]);
+  const [warehouseId, setWarehouseId] = useState(String(draft?.warehouseId ?? warehouses[0]?.id ?? ""));
+  const [toWarehouseId, setToWarehouseId] = useState(String(draft?.toWarehouseId ?? warehouses[1]?.id ?? warehouses[0]?.id ?? ""));
+  const [counterparty, setCounterparty] = useState(draft?.counterparty ?? "");
+  const [reference, setReference] = useState(draft?.reference ?? "");
+  const [memo, setMemo] = useState(draft?.memo ?? "");
+  const [paid, setPaid] = useState(draft?.paid ?? false);
+  const [currency, setCurrency] = useState<Currency>((draft?.currency as Currency) ?? "EUR");
+  const [fxRate, setFxRate] = useState(draft?.fxRate ?? "");
+  const [cashType, setCashType] = useState<CashMode>(draft?.cashType ?? "RECEIVE_CUSTOMER");
+  const [cashAmount, setCashAmount] = useState(draft?.amount ?? "");
+  const [settleId, setSettleId] = useState(String(openInvoices[0]?.id ?? ""));
+  const [rows, setRows] = useState<Row[]>(
+    draft?.lines?.length
+      ? draft.lines.map((l) => ({ key: rowKey++, itemId: String(l.itemId), qty: l.qty, amount: l.amount, vat: l.vatRate !== undefined ? String(l.vatRate) : "" }))
+      : [blankRow()],
+  );
 
   const wh = Number(warehouseId);
   const itemById = useMemo(() => new Map(items.map((i) => [i.id, i])), [items]);
   const minDate = lockedThrough ? nextDay(lockedThrough) : undefined;
+  const foreign = kind === "RECEIPT" && currency !== "EUR";
+  const invoice = openInvoices.find((o) => String(o.id) === settleId);
 
   const position = (itemId: number, w = wh) => itemById.get(itemId)?.byWarehouse[w] ?? { qty: 0, value: 0 };
   const avg = (itemId: number, w = wh) => {
     const p = position(itemId, w);
     return p.qty ? p.value / p.qty : 0;
   };
+  const vatFor = (r: Row) => (foreign ? 0 : r.vat !== "" ? Number(r.vat) : (itemById.get(Number(r.itemId))?.vatRate ?? 19));
 
-  // Client-side estimate of the journal. The server recomputes everything; this only shows intent.
   const preview = useMemo(() => {
     const parsed = rows.map((r) => ({
       itemId: Number(r.itemId),
       qty: parseQty(r.qty, kind === "ADJUSTMENT") ?? 0,
-      amount: r.amount === "" ? null : parseMoney(r.amount),
+      amount: r.amount === "" ? null : kind === "RECEIPT" ? parseIn(currency, r.amount) : parseMoney(r.amount),
+      vat: vatFor(r),
     }));
     const valid = parsed.filter((p) => p.itemId && p.qty);
     const lines: { account: string; debit: number; credit: number }[] = [];
     let estimated = false;
     if (kind === "RECEIPT") {
-      const total = valid.reduce((s, l) => s + l.qty * (l.amount ?? 0), 0);
-      lines.push({ account: ACC.INV, debit: total, credit: 0 }, { account: paid ? ACC.CASH : ACC.AP, debit: 0, credit: total });
+      const net = valid.reduce((s, l) => s + (foreign ? estEur(l.qty * (l.amount ?? 0), currency, fxRate) : l.qty * (l.amount ?? 0)), 0);
+      const vat = valid.reduce((s, l) => s + Math.round(((foreign ? 0 : l.qty * (l.amount ?? 0)) * l.vat) / 100), 0);
+      estimated = foreign;
+      lines.push({ account: ACC.INV, debit: net, credit: 0 });
+      if (vat) lines.push({ account: ACC.VAT_IN, debit: vat, credit: 0 });
+      lines.push({ account: paid ? ACC.CASH : ACC.AP, debit: 0, credit: net + vat });
     } else if (kind === "SALE") {
       const rev = valid.reduce((s, l) => s + l.qty * (l.amount ?? 0), 0);
+      const vat = valid.reduce((s, l) => s + Math.round((l.qty * (l.amount ?? 0) * l.vat) / 100), 0);
       const cogs = valid.reduce((s, l) => s + Math.round(l.qty * avg(l.itemId)), 0);
       estimated = true;
       lines.push(
-        { account: paid ? ACC.CASH : ACC.AR, debit: rev, credit: 0 },
+        { account: paid ? ACC.CASH : ACC.AR, debit: rev + vat, credit: 0 },
         { account: ACC.REVENUE, debit: 0, credit: rev },
-        { account: ACC.COGS, debit: cogs, credit: 0 },
-        { account: ACC.INV, debit: 0, credit: cogs },
       );
+      if (vat) lines.push({ account: ACC.VAT_OUT, debit: 0, credit: vat });
+      lines.push({ account: ACC.COGS, debit: cogs, credit: 0 }, { account: ACC.INV, debit: 0, credit: cogs });
     } else if (kind === "ADJUSTMENT") {
       const net = valid.reduce((s, l) => s + Math.round(l.qty * (l.qty > 0 && l.amount !== null ? l.amount : avg(l.itemId))), 0);
       estimated = true;
       if (net >= 0) lines.push({ account: ACC.INV, debit: net, credit: 0 }, { account: ACC.SHRINK, debit: 0, credit: net });
       else lines.push({ account: ACC.SHRINK, debit: -net, credit: 0 }, { account: ACC.INV, debit: 0, credit: -net });
     } else if (kind === "PAYMENT") {
-      const amt = parseMoney(cashAmount) ?? 0;
-      const pairs: Record<CashType, [string, string]> = {
-        PAY_SUPPLIER: [ACC.AP, ACC.CASH],
-        RECEIVE_CUSTOMER: [ACC.CASH, ACC.AR],
-        EXPENSE: [ACC.OPEX, ACC.CASH],
-        CAPITAL: [ACC.CASH, ACC.EQUITY],
-      };
-      lines.push({ account: pairs[cashType][0], debit: amt, credit: 0 }, { account: pairs[cashType][1], debit: 0, credit: amt });
+      if (cashType === "SETTLE_FX") {
+        if (invoice) {
+          const paidEur = estEur(invoice.foreign_amount, invoice.currency, fxRate);
+          const diff = paidEur - invoice.eur_amount;
+          estimated = true;
+          lines.push({ account: ACC.AP, debit: invoice.eur_amount, credit: 0 }, { account: ACC.CASH, debit: 0, credit: paidEur });
+          if (diff > 0) lines.push({ account: ACC.FX_LOSS, debit: diff, credit: 0 });
+          if (diff < 0) lines.push({ account: ACC.FX_GAIN, debit: 0, credit: -diff });
+        }
+      } else if (cashType === "PAY_VAT") {
+        lines.push(vatNet >= 0 ? { account: ACC.VAT_OUT, debit: vatNet, credit: 0 } : { account: ACC.CASH, debit: -vatNet, credit: 0 });
+        lines.push(vatNet >= 0 ? { account: ACC.CASH, debit: 0, credit: vatNet } : { account: ACC.VAT_IN, debit: 0, credit: -vatNet });
+      } else {
+        const amt = parseMoney(cashAmount) ?? 0;
+        const pairs: Record<Exclude<CashMode, "SETTLE_FX" | "PAY_VAT">, [string, string]> = {
+          PAY_SUPPLIER: [ACC.AP, ACC.CASH],
+          RECEIVE_CUSTOMER: [ACC.CASH, ACC.AR],
+          EXPENSE: [ACC.OPEX, ACC.CASH],
+          CAPITAL: [ACC.CASH, ACC.EQUITY],
+        };
+        lines.push({ account: pairs[cashType][0], debit: amt, credit: 0 }, { account: pairs[cashType][1], debit: 0, credit: amt });
+      }
     }
     const value = kind === "TRANSFER" ? valid.reduce((s, l) => s + Math.round(l.qty * avg(l.itemId)), 0) : 0;
     return { lines, estimated, transferValue: value };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rows, kind, paid, cashType, cashAmount, warehouseId, items]);
+  }, [rows, kind, paid, cashType, cashAmount, warehouseId, items, currency, fxRate, settleId, vatNet]);
 
   const setRow = (k: number, patch: Partial<Row>) => setRows((rs) => rs.map((r) => (r.key === k ? { ...r, ...patch } : r)));
 
   function build(): TxPayload | string {
     const base = { docDate, reference, memo, idempotencyKey: key.current };
     if (kind === "PAYMENT") {
+      if (cashType === "SETTLE_FX") {
+        if (!invoice) return "Choose the foreign-currency invoice to pay.";
+        if (!fxRate.trim()) return "Enter today's exchange rate.";
+        return { ...base, kind: "SETTLE_FX", receiptId: invoice.id, fxRate: fxRate.trim() };
+      }
+      if (cashType === "PAY_VAT") return { ...base, kind, cashType, amount: 0, counterparty };
       const amount = parseMoney(cashAmount);
       if (!amount) return "Enter an amount, for example 120.50.";
       return { ...base, kind, cashType, amount, counterparty };
     }
-    const lines: { itemId: number; qty: number; amount?: number }[] = [];
+    if (foreign && !fxRate.trim()) return `Enter the ${currency} → EUR exchange rate.`;
+    const lines: { itemId: number; qty: number; amount?: number; vatRate?: number }[] = [];
     for (const [n, r] of rows.entries()) {
       if (!r.itemId && !r.qty && !r.amount) continue;
       const item = itemById.get(Number(r.itemId));
@@ -138,7 +198,7 @@ export function TransactionForm({
       if (!qty) return `Line ${n + 1}: enter a whole-number quantity${kind === "ADJUSTMENT" ? " (negative to remove)" : ""}.`;
       let amount: number | undefined;
       if (kind === "RECEIPT" || kind === "SALE") {
-        const a = parseMoney(r.amount);
+        const a = kind === "RECEIPT" ? parseIn(currency, r.amount) : parseMoney(r.amount);
         if (a === null) return `Line ${n + 1}: enter a unit ${kind === "SALE" ? "price" : "cost"}.`;
         amount = a;
       } else if (kind === "ADJUSTMENT" && r.amount.trim()) {
@@ -146,12 +206,13 @@ export function TransactionForm({
         if (a === null) return `Line ${n + 1}: unit cost is not a valid amount.`;
         amount = a;
       }
-      lines.push({ itemId: item.id, qty, amount });
+      lines.push({ itemId: item.id, qty, amount, vatRate: kind === "RECEIPT" || kind === "SALE" ? vatFor(r) : undefined });
     }
     if (!lines.length) return "Add at least one line.";
-    if (kind === "RECEIPT" || kind === "SALE") {
-      return { ...base, kind, warehouseId: wh, counterparty, paid, lines: lines.map((l) => ({ ...l, amount: l.amount! })) };
+    if (kind === "RECEIPT") {
+      return { ...base, kind, warehouseId: wh, counterparty, paid, currency, fxRate: foreign ? fxRate.trim() : undefined, lines: lines.map((l) => ({ ...l, amount: l.amount! })) };
     }
+    if (kind === "SALE") return { ...base, kind, warehouseId: wh, counterparty, paid, lines: lines.map((l) => ({ ...l, amount: l.amount! })) };
     if (kind === "TRANSFER") return { ...base, kind, warehouseId: wh, toWarehouseId: Number(toWarehouseId), lines };
     return { ...base, kind, warehouseId: wh, lines };
   }
@@ -163,24 +224,29 @@ export function TransactionForm({
     setError(null);
     start(async () => {
       const r = await postTransaction(payload);
-      if (r.ok) {
-        key.current = crypto.randomUUID();
-        router.push(`/transactions/${r.id}`);
-      } else {
-        setError(r.error);
-        key.current = crypto.randomUUID();
-      }
+      key.current = crypto.randomUUID();
+      if (r.ok) router.push(`/transactions/${r.id}`);
+      else setError(r.error);
     });
   }
 
   const tab = TABS.find((t) => t.kind === kind)!;
-  const amountLabel = kind === "SALE" ? "Unit price" : kind === "ADJUSTMENT" ? "Unit cost (optional)" : "Unit cost";
+  const amountLabel = kind === "SALE" ? "Unit price (net)" : kind === "ADJUSTMENT" ? "Unit cost (opt.)" : `Unit cost (net${foreign ? `, ${currency}` : ""})`;
   const hasAmount = kind === "RECEIPT" || kind === "SALE" || kind === "ADJUSTMENT";
+  const hasVat = kind === "RECEIPT" || kind === "SALE";
   const debits = preview.lines.reduce((s, l) => s + l.debit, 0);
 
   return (
     <form onSubmit={submit} className="grid gap-6 xl:grid-cols-[1fr_360px]">
       <div className="space-y-6">
+        {draft && (
+          <div className="flex items-start gap-3 rounded-2xl border border-accent/30 bg-accent-soft p-4 text-sm">
+            <Sparkles className="mt-0.5 size-4 shrink-0 text-accent" />
+            <p className="text-ink">
+              <span className="font-semibold text-accent">Drafted by Copilot.</span> Check every field below. Nothing has been posted; it is recorded only when you click <span className="font-medium">{tab.cta}</span>.
+            </p>
+          </div>
+        )}
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
           {TABS.map(({ kind: k, label, icon: Icon }) => (
             <button
@@ -220,28 +286,65 @@ export function TransactionForm({
                 </select>
               </div>
             )}
+            {kind === "RECEIPT" && (
+              <div>
+                <label className="label flex items-center gap-1" htmlFor="cur"><Globe2 className="size-3" /> Invoice currency</label>
+                <div className="flex gap-2">
+                  <select id="cur" className="field w-24!" value={currency} onChange={(e) => setCurrency(e.target.value as Currency)}>
+                    {CURRENCIES.map((c) => <option key={c}>{c}</option>)}
+                  </select>
+                  {foreign && <input aria-label="Exchange rate" inputMode="decimal" className="field num" placeholder={`EUR per 1 ${currency}`} value={fxRate} onChange={(e) => setFxRate(e.target.value)} />}
+                </div>
+                {foreign && <p className="mt-1 text-[11px] text-muted">Imports post with 0% VAT. Pay later via Cash → Pay foreign-currency invoice.</p>}
+              </div>
+            )}
             {kind === "PAYMENT" && (
               <>
                 <div>
                   <label className="label" htmlFor="ctype">Type</label>
-                  <select id="ctype" className="field" value={cashType} onChange={(e) => setCashType(e.target.value as CashType)}>
+                  <select id="ctype" className="field" value={cashType} onChange={(e) => setCashType(e.target.value as CashMode)}>
                     {CASH_TYPES.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
                   </select>
                 </div>
-                <div>
-                  <label className="label" htmlFor="amt">Amount (EUR)</label>
-                  <input id="amt" inputMode="decimal" className="field num" placeholder="0.00" value={cashAmount} onChange={(e) => setCashAmount(e.target.value)} />
-                  <p className="mt-1 text-[11px] text-muted">
-                    {cashType === "PAY_SUPPLIER" && `Owed to suppliers: ${fmtMoney(payables)}`}
-                    {cashType === "RECEIVE_CUSTOMER" && `Owed by customers: ${fmtMoney(receivables)}`}
-                  </p>
-                </div>
+                {cashType === "SETTLE_FX" ? (
+                  <>
+                    <div>
+                      <label className="label" htmlFor="inv">Open invoice</label>
+                      <select id="inv" className="field" value={settleId} onChange={(e) => setSettleId(e.target.value)}>
+                        {openInvoices.length === 0 && <option value="">No open foreign invoices</option>}
+                        {openInvoices.map((o) => (
+                          <option key={o.id} value={o.id}>#{o.id} · {o.counterparty} · {fmtForeign(o.foreign_amount, o.currency)}</option>
+                        ))}
+                      </select>
+                      {invoice && <p className="mt-1 text-[11px] text-muted">Booked at {invoice.fx_rate} = {fmtMoney(invoice.eur_amount)} on {invoice.doc_date}</p>}
+                    </div>
+                    <div>
+                      <label className="label" htmlFor="rate">Today&apos;s rate (EUR per 1 {invoice?.currency ?? "unit"})</label>
+                      <input id="rate" inputMode="decimal" className="field num" placeholder={invoice?.fx_rate ?? "0.92"} value={fxRate} onChange={(e) => setFxRate(e.target.value)} />
+                    </div>
+                  </>
+                ) : cashType === "PAY_VAT" ? (
+                  <div>
+                    <span className="label">Amount (computed)</span>
+                    <p className="field num bg-surface-2!">{vatNet >= 0 ? `Pay ${fmtMoney(vatNet)}` : `Refund ${fmtMoney(-vatNet)}`}</p>
+                    <p className="mt-1 text-[11px] text-muted">Clears output and input VAT exactly.</p>
+                  </div>
+                ) : (
+                  <div>
+                    <label className="label" htmlFor="amt">Amount (EUR)</label>
+                    <input id="amt" inputMode="decimal" className="field num" placeholder="0.00" value={cashAmount} onChange={(e) => setCashAmount(e.target.value)} />
+                    <p className="mt-1 text-[11px] text-muted">
+                      {cashType === "PAY_SUPPLIER" && `Owed to suppliers: ${fmtMoney(payables)}`}
+                      {cashType === "RECEIVE_CUSTOMER" && `Owed by customers: ${fmtMoney(receivables)}`}
+                    </p>
+                  </div>
+                )}
               </>
             )}
-            {(kind === "RECEIPT" || kind === "SALE" || kind === "PAYMENT") && (
+            {(kind === "RECEIPT" || kind === "SALE" || (kind === "PAYMENT" && cashType !== "SETTLE_FX")) && (
               <div>
                 <label className="label" htmlFor="cp">{kind === "RECEIPT" ? "Supplier" : kind === "SALE" ? "Customer" : "Counterparty"}</label>
-                <input id="cp" className="field" value={counterparty} onChange={(e) => setCounterparty(e.target.value)} placeholder={kind === "SALE" ? "Café Kranich" : "Rösterei Nord GmbH"} />
+                <input id="cp" className="field" value={counterparty} onChange={(e) => setCounterparty(e.target.value)} placeholder={kind === "SALE" ? "Café Kranich" : cashType === "PAY_VAT" ? "Finanzamt" : "Rösterei Nord GmbH"} />
               </div>
             )}
             <div>
@@ -275,13 +378,13 @@ export function TransactionForm({
                 const item = itemById.get(id);
                 const pos = position(id);
                 const qty = parseQty(r.qty, kind === "ADJUSTMENT") ?? 0;
-                const amt = parseMoney(r.amount);
+                const amt = kind === "RECEIPT" ? parseIn(currency, r.amount) : parseMoney(r.amount);
                 const over = item && kind !== "RECEIPT" && (kind === "ADJUSTMENT" ? -qty : qty) > pos.qty;
                 return (
                   <div key={r.key} className="grid grid-cols-12 items-start gap-3 px-5 py-4">
-                    <div className="col-span-12 sm:col-span-5">
+                    <div className={`col-span-12 ${hasVat ? "sm:col-span-4" : "sm:col-span-5"}`}>
                       {n === 0 && <span className="label">Item</span>}
-                      <select className="field" value={r.itemId} onChange={(e) => setRow(r.key, { itemId: e.target.value })}>
+                      <select className="field" value={r.itemId} onChange={(e) => setRow(r.key, { itemId: e.target.value, vat: "" })}>
                         <option value="">Choose item…</option>
                         {items.map((i) => <option key={i.id} value={i.id}>{i.sku} · {i.name}</option>)}
                       </select>
@@ -291,23 +394,31 @@ export function TransactionForm({
                         </p>
                       )}
                     </div>
-                    <div className={hasAmount ? "col-span-5 sm:col-span-2" : "col-span-10 sm:col-span-6"}>
+                    <div className={hasAmount ? "col-span-4 sm:col-span-2" : "col-span-10 sm:col-span-6"}>
                       {n === 0 && <span className="label">{kind === "ADJUSTMENT" ? "Qty ±" : "Qty"}</span>}
                       <input inputMode="numeric" className="field num" placeholder={kind === "ADJUSTMENT" ? "-2" : "10"} value={r.qty} onChange={(e) => setRow(r.key, { qty: e.target.value })} />
                     </div>
                     {hasAmount && (
-                      <div className="col-span-5 sm:col-span-3">
-                        {n === 0 && <span className="label">{amountLabel}</span>}
+                      <div className={hasVat ? "col-span-4 sm:col-span-3" : "col-span-6 sm:col-span-4"}>
+                        {n === 0 && <span className="label truncate">{amountLabel}</span>}
                         <input inputMode="decimal" className="field num" placeholder={kind === "ADJUSTMENT" ? "avg cost" : "0.00"} value={r.amount} onChange={(e) => setRow(r.key, { amount: e.target.value })} disabled={kind === "ADJUSTMENT" && qty < 0} />
                         {(kind === "RECEIPT" || kind === "SALE") && qty > 0 && amt !== null && (
                           <p className="num mt-1 text-[11px] text-muted">
-                            = {fmtMoney(qty * amt)}
+                            = {foreign ? `${fmtForeign(qty * amt, currency)} ≈ ${fmtMoney(estEur(qty * amt, currency, fxRate))}` : fmtMoney(qty * amt)}
                             {kind === "SALE" && item && avg(id) > 0 && ` · margin ${(((amt - avg(id)) / amt) * 100 || 0).toFixed(0)}%`}
                           </p>
                         )}
                       </div>
                     )}
-                    <div className="col-span-2 flex justify-end sm:col-span-1">
+                    {hasVat && (
+                      <div className="col-span-3 sm:col-span-2">
+                        {n === 0 && <span className="label">VAT</span>}
+                        <select className="field" value={foreign ? "0" : String(vatFor(r))} disabled={foreign} onChange={(e) => setRow(r.key, { vat: e.target.value })}>
+                          {VAT_RATES.map((v) => <option key={v} value={v}>{v}%</option>)}
+                        </select>
+                      </div>
+                    )}
+                    <div className="col-span-1 flex justify-end">
                       {n === 0 && <span className="label invisible">x</span>}
                       <button type="button" aria-label="Remove line" className="grid size-9 place-items-center rounded-lg text-muted hover:bg-neg-soft hover:text-neg disabled:opacity-30" disabled={rows.length === 1} onClick={() => setRows((rs) => rs.filter((x) => x.key !== r.key))}>
                         <Trash2 className="size-4" />
@@ -326,7 +437,7 @@ export function TransactionForm({
           <div className="border-b border-line px-5 py-4">
             <h2 className="text-sm font-semibold">Journal preview</h2>
             <p className="mt-0.5 text-xs text-muted">
-              {preview.estimated ? "Cost at current moving average (estimate). The server computes the exact figures." : "The double entry this will post."}
+              {preview.estimated ? "Estimated at the current average cost or rate. The server computes the exact figures." : "The double entry this will post."}
             </p>
           </div>
           <div className="px-5 py-4">

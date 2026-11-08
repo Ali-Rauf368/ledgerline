@@ -4,13 +4,15 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { openPalette } from "./CommandPalette";
 import { openCopilot } from "./Copilot";
-import { Search, Sparkles, ArrowLeftRight, Boxes, CalendarCheck, FileBarChart, LayoutDashboard, Plus, ScrollText, ShieldCheck } from "lucide-react";
+import { Lightbulb, Target, Search, Sparkles, ArrowLeftRight, Boxes, CalendarCheck, FileBarChart, LayoutDashboard, Plus, ScrollText, ShieldCheck } from "lucide-react";
 
 const NAV = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
   { href: "/inventory", label: "Inventory", icon: Boxes },
   { href: "/transactions", label: "Journal", icon: ArrowLeftRight },
+  { href: "/insights", label: "Insights", icon: Lightbulb },
   { href: "/reports", label: "Reports", icon: FileBarChart },
+  { href: "/budgets", label: "Budgets", icon: Target },
   { href: "/periods", label: "Periods", icon: CalendarCheck },
   { href: "/integrity", label: "Integrity", icon: ShieldCheck },
   { href: "/audit", label: "Audit log", icon: ScrollText },

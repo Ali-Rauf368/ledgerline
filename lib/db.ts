@@ -15,7 +15,9 @@ export const get = <T>(db: DB, sql: string, ...p: Param[]) => {
 export const run = (db: DB, sql: string, ...p: Param[]) => db.prepare(sql).run(...p);
 
 /** Tables that may only ever grow. Enforced by the database itself, not just the app. */
-export const APPEND_ONLY_TABLES = ["journals", "journal_lines", "stock_moves", "period_closes", "audit_events"];
+export const APPEND_ONLY_TABLES = ["journals", "journal_lines", "stock_moves", "period_closes", "audit_events", "budget_entries", "commentaries"];
+
+export const SCHEMA_VERSION = 2;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS accounts (
@@ -34,11 +36,12 @@ CREATE TABLE IF NOT EXISTS items (
   name TEXT NOT NULL,
   unit TEXT NOT NULL DEFAULT 'pcs',
   category TEXT NOT NULL DEFAULT 'General',
+  vat_rate INTEGER NOT NULL DEFAULT 19 CHECK (vat_rate IN (0, 7, 19)),
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS journals (
   id INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL CHECK (kind IN ('RECEIPT','SALE','TRANSFER','ADJUSTMENT','PAYMENT','REVERSAL')),
+  kind TEXT NOT NULL CHECK (kind IN ('RECEIPT','SALE','TRANSFER','ADJUSTMENT','PAYMENT','REVERSAL','CLOSING')),
   doc_date TEXT NOT NULL,
   posted_at TEXT NOT NULL,
   memo TEXT NOT NULL DEFAULT '',
@@ -46,8 +49,13 @@ CREATE TABLE IF NOT EXISTS journals (
   counterparty TEXT NOT NULL DEFAULT '',
   reverses_id INTEGER UNIQUE REFERENCES journals(id),
   idempotency_key TEXT UNIQUE,
+  currency TEXT,
+  fx_rate TEXT,
+  foreign_amount INTEGER,
+  settles_id INTEGER REFERENCES journals(id),
   prev_hash TEXT NOT NULL,
-  hash TEXT NOT NULL UNIQUE
+  hash TEXT NOT NULL UNIQUE,
+  CHECK ((currency IS NULL) = (fx_rate IS NULL) AND (currency IS NULL) = (foreign_amount IS NULL))
 );
 CREATE INDEX IF NOT EXISTS ix_journals_date ON journals(doc_date);
 CREATE TABLE IF NOT EXISTS journal_lines (
@@ -81,6 +89,23 @@ CREATE TABLE IF NOT EXISTS period_closes (
   snapshot TEXT NOT NULL,
   snapshot_hash TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS budget_entries (
+  id INTEGER PRIMARY KEY,
+  period TEXT NOT NULL,
+  account_code TEXT NOT NULL REFERENCES accounts(code),
+  amount INTEGER NOT NULL CHECK (amount >= 0),
+  created_at TEXT NOT NULL,
+  created_by TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_budget ON budget_entries(period, account_code, id);
+CREATE TABLE IF NOT EXISTS commentaries (
+  id INTEGER PRIMARY KEY,
+  period TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  source TEXT NOT NULL,
+  text TEXT NOT NULL,
+  data_hash TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS audit_events (
   id INTEGER PRIMARY KEY,
   at TEXT NOT NULL,
@@ -94,7 +119,13 @@ export function openDb(file: string): DB {
   if (file !== ":memory:") fs.mkdirSync(path.dirname(file), { recursive: true });
   const db = new DatabaseSync(file);
   db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+  const existing = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'journals'").get();
+  const version = (db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version;
+  if (existing && version < SCHEMA_VERSION) {
+    throw new Error(`The database at ${file} uses an older schema (v${version}). Run "npm run seed" to rebuild it with the v${SCHEMA_VERSION} schema.`);
+  }
   db.exec(SCHEMA);
+  db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
   for (const t of APPEND_ONLY_TABLES) {
     db.exec(`
       CREATE TRIGGER IF NOT EXISTS ${t}_no_update BEFORE UPDATE ON ${t}

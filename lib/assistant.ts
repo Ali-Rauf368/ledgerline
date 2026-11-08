@@ -9,15 +9,22 @@ import Anthropic from "@anthropic-ai/sdk";
 import type { DB } from "./db";
 import { ACC, KIND_LABEL } from "./accounts";
 import { verifyLedger } from "./integrity";
-import { rawBalance, today } from "./ledger";
+import { lockedThrough, monthEnd, openForeignInvoices, rawBalance, sha256, today, vatPosition } from "./ledger";
+import type { CashType } from "./ledger";
+import { detectAnomalies, forecastCash, forecastDemand } from "./analytics";
+import type { TxDraft } from "./draft";
+import { draftHref } from "./draft";
+import { all, run } from "./db";
 import { fmtMoney } from "./money";
 import {
+  budgetVsActual, fifoComparison, fxActivity, vatReport, warehouses,
   balanceSheet, dashboard, incomeStatement, inventoryValuation, itemsOverview, journalDetail, journalsList,
   reorderInsights, stockCard,
 } from "./reports";
 
 export type ChatTurn = { role: "user" | "assistant"; text: string };
-export type AssistantReply = { text: string; tools: string[]; mode: "ai" | "offline"; notice?: string };
+export type DraftLink = { label: string; href: string };
+export type AssistantReply = { text: string; tools: string[]; mode: "ai" | "offline"; notice?: string; drafts?: DraftLink[] };
 
 const MODEL = "claude-opus-5-5";
 const eur = (c: number) => fmtMoney(c);
@@ -26,7 +33,9 @@ const SYSTEM = `You are Ledger Copilot, the assistant inside Ledgerline, an appe
 
 Use the tools to look up real figures before answering any question about stock, sales, costs, cash or the books; never guess numbers. Cite the figures you used, and mention journal ids as #123 and SKUs in backticks so the user can find them.
 
-You are read-only. If the user wants to post, reverse or close something, explain the steps in the app (New transaction, the Reverse button on a journal, or the Periods page) instead of claiming you did it. Ledger rules you can explain: entries are never edited, corrections are reversals; moving-average costing in cents; no backdating before an item's latest movement; closed months are locked and their snapshots verified; each journal is SHA-256 hash-chained.
+You are read-only: you never post anything yourself. When the user asks you to record a receipt, sale, transfer, adjustment or cash movement, call draft_transaction. The app shows the user a "Review & post" button that opens a pre-filled form they check and post. Say that you prepared a draft for review; never say it was posted. For reversals or period closes, explain the steps in the app (the Reverse button on a journal, or the Periods page).
+
+The books have VAT (7% coffee, 19% other goods; input VAT 1400, output VAT 2100, settled monthly), foreign-currency purchase invoices with realised FX gains/losses on settlement, budgets by month, year-end closes into retained earnings (3100), statistical anomaly detection, and 30-day demand and cash forecasts. Use the matching tools. Ledger rules you can explain: entries are never edited, corrections are reversals; moving-average costing in cents; no backdating before an item's latest movement; closed months are locked and their snapshots verified; each journal is SHA-256 hash-chained.
 
 Keep answers short and scannable: a direct answer first, then a few bullet points if useful. Use **bold** for key numbers. Today is ${today()}.`;
 
@@ -70,6 +79,46 @@ const TOOLS: Anthropic.Beta.BetaTool[] = [
     description: "Full detail of one journal entry: GL lines, stock moves, hash, and reversal links.",
     input_schema: { type: "object", properties: { id: { type: "integer" } }, required: ["id"] },
   },
+  { name: "find_anomalies", description: "Statistically unusual activity: purchase cost spikes, below-cost or thin-margin sales, large write-offs, unusually large entries, late postings, possible duplicates. Optional 'since' date.", input_schema: { type: "object", properties: { since: { type: "string", description: "YYYY-MM-DD" } } } },
+  { name: "demand_forecast", description: "30-day unit demand forecast per item (seasonal exponential smoothing) with an ~80% range, projected stock-out date and back-tested accuracy.", input_schema: { type: "object", properties: {} } },
+  { name: "cash_forecast", description: "30-day cash projection from recent operating cash flow plus scheduled items (VAT settlement), with an ~80% band.", input_schema: { type: "object", properties: {} } },
+  {
+    name: "vat_summary",
+    description: "VAT return for a date range (output VAT, input VAT, net payable, settlements) plus the current outstanding VAT position.",
+    input_schema: { type: "object", properties: { from: { type: "string" }, to: { type: "string" } }, required: ["from", "to"] },
+  },
+  { name: "budget_vs_actual", description: "Monthly budget vs actual for revenue, cost of goods sold and operating expenses for a year, with year-to-date variance (positive = favourable).", input_schema: { type: "object", properties: { year: { type: "string" } }, required: ["year"] } },
+  { name: "fx_overview", description: "Open foreign-currency supplier invoices and realised FX gains/losses on settled ones.", input_schema: { type: "object", properties: {} } },
+  { name: "fifo_comparison", description: "What inventory value and cost of goods sold would be under FIFO instead of the ledger's moving-average policy.", input_schema: { type: "object", properties: {} } },
+  {
+    name: "draft_transaction",
+    description: "Prepare (NOT post) a transaction for the user to review and post. Amounts are in major units of the currency (e.g. 26.90). unit_amount is unit cost for receipts, unit price for sales, optional unit cost for positive adjustments. qty is negative for stock removals in adjustments.",
+    input_schema: {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["RECEIPT", "SALE", "TRANSFER", "ADJUSTMENT", "PAYMENT"] },
+        warehouse_code: { type: "string", description: "BER or LEJ; default BER. For transfers this is the source." },
+        to_warehouse_code: { type: "string" },
+        counterparty: { type: "string" },
+        paid: { type: "boolean", description: "Paid immediately instead of on account" },
+        memo: { type: "string" },
+        reference: { type: "string" },
+        currency: { type: "string", enum: ["EUR", "USD", "GBP", "CHF", "JPY"] },
+        fx_rate: { type: "string", description: "EUR per 1 unit of foreign currency" },
+        lines: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { sku: { type: "string" }, qty: { type: "integer" }, unit_amount: { type: "string" }, vat_rate: { type: "integer", enum: [0, 7, 19] } },
+            required: ["sku", "qty"],
+          },
+        },
+        cash_type: { type: "string", enum: ["PAY_SUPPLIER", "RECEIVE_CUSTOMER", "EXPENSE", "CAPITAL", "PAY_VAT"] },
+        amount: { type: "string" },
+      },
+      required: ["kind"],
+    },
+  },
   { name: "run_integrity_check", description: "Run the independent ledger verification (hash chain, balancing, sub-ledger reconciliation, closed-period snapshots and more).", input_schema: { type: "object", properties: {} } },
 ];
 
@@ -83,10 +132,89 @@ export const TOOL_LABEL: Record<string, string> = {
   search_journal: "Journal search",
   get_journal: "Journal entry",
   run_integrity_check: "Integrity check",
+  find_anomalies: "Anomaly scan",
+  demand_forecast: "Demand forecast",
+  cash_forecast: "Cash forecast",
+  vat_summary: "VAT return",
+  budget_vs_actual: "Budget vs actual",
+  fx_overview: "FX",
+  fifo_comparison: "FIFO comparison",
+  draft_transaction: "Draft",
 };
 
-function runTool(db: DB, name: string, input: Record<string, unknown>): unknown {
+function buildDraft(db: DB, input: Record<string, unknown>): { draft?: TxDraft; label?: string; error?: string } {
+  const whs = warehouses(db);
+  const items = itemsOverview(db);
+  const wh = (code: unknown) => whs.find((w) => w.code === String(code ?? "BER").toUpperCase())?.id;
+  const kind = String(input.kind) as TxDraft["kind"];
+  const d: TxDraft = {
+    kind,
+    warehouseId: wh(input.warehouse_code),
+    toWarehouseId: input.to_warehouse_code ? wh(input.to_warehouse_code) : undefined,
+    counterparty: input.counterparty ? String(input.counterparty) : undefined,
+    paid: Boolean(input.paid),
+    memo: input.memo ? String(input.memo) : undefined,
+    reference: input.reference ? String(input.reference) : undefined,
+    currency: input.currency ? String(input.currency) : undefined,
+    fxRate: input.fx_rate ? String(input.fx_rate) : undefined,
+  };
+  if (kind === "PAYMENT") {
+    d.cashType = (input.cash_type ? String(input.cash_type) : "EXPENSE") as CashType;
+    d.amount = input.amount ? String(input.amount) : undefined;
+    if (!d.amount && d.cashType !== "PAY_VAT") return { error: "A cash movement needs an amount." };
+    return { draft: d, label: `${d.cashType.replaceAll("_", " ").toLowerCase()}${d.amount ? ` €${d.amount}` : ""}` };
+  }
+  const lines = Array.isArray(input.lines) ? (input.lines as Record<string, unknown>[]) : [];
+  if (!lines.length) return { error: "Add at least one line with a SKU and quantity." };
+  d.lines = [];
+  for (const l of lines) {
+    const item = items.find((i) => i.sku === String(l.sku ?? "").toUpperCase());
+    if (!item) return { error: `Unknown SKU ${l.sku}. Known: ${items.map((i) => i.sku).join(", ")}` };
+    const vat = all<{ vat_rate: number }>(db, "SELECT vat_rate FROM items WHERE id = ?", item.id)[0]?.vat_rate ?? 19;
+    d.lines.push({
+      itemId: item.id,
+      qty: String(l.qty),
+      amount: l.unit_amount !== undefined ? String(l.unit_amount) : "",
+      vatRate: kind === "RECEIPT" && d.currency && d.currency !== "EUR" ? 0 : l.vat_rate !== undefined ? Number(l.vat_rate) : vat,
+    });
+  }
+  if (!d.warehouseId) return { error: "Unknown warehouse code; use BER or LEJ." };
+  const what = lines.map((l) => `${l.qty} × ${String(l.sku).toUpperCase()}`).join(", ");
+  return { draft: d, label: `${kind.toLowerCase()}: ${what}` };
+}
+
+function runTool(db: DB, name: string, input: Record<string, unknown>, drafts: DraftLink[] = []): unknown {
   switch (name) {
+    case "find_anomalies":
+      return detectAnomalies(db, { since: input.since ? String(input.since) : undefined }).slice(0, 25).map((a) => ({ severity: a.severity, type: a.type, title: a.title, detail: a.detail, date: a.date, journal: a.journalId ? `#${a.journalId}` : null }));
+    case "demand_forecast":
+      return forecastDemand(db).map((f) => ({ sku: f.sku, name: f.name, on_hand: f.onHand, forecast_30d: f.forecast30, range_80pct: `${f.low30}–${f.high30}`, projected_stockout: f.stockoutDate ?? "not within 30 days", backtest_accuracy: f.accuracy === null ? "n/a" : `${Math.round(f.accuracy * 100)}%` }));
+    case "cash_forecast": {
+      const c = forecastCash(db);
+      return { cash_now: eur(c.current), projected_in_30_days: eur(c.projected), range_80pct: `${eur(c.low)} – ${eur(c.high)}`, avg_daily_operating_flow: eur(Math.round(c.dailyDrift)), scheduled: c.scheduled.map((x) => ({ ...x, amount: eur(x.amount) })) };
+    }
+    case "vat_summary": {
+      const r = vatReport(db, { from: String(input.from), asOf: String(input.to) });
+      return { output_vat: eur(r.output), input_vat: eur(r.input), net_payable: eur(r.net), net_sales: eur(r.taxableSales), effective_output_rate: `${(r.effectiveRate * 100).toFixed(1)}%`, settlements: r.settlements.map((x) => ({ journal: `#${x.id}`, date: x.doc_date, paid: eur(x.amount) })), currently_outstanding: eur(vatPosition(db).net) };
+    }
+    case "budget_vs_actual": {
+      const b = budgetVsActual(db, String(input.year ?? today().slice(0, 4)));
+      return b.rows.map((r) => ({ account: r.code, ytd_actual: eur(r.ytdActual), ytd_budget: eur(r.ytdBudget), ytd_variance_favourable: eur(r.ytdVariance), months: r.cells.filter((c) => c.actual !== null).map((c) => ({ month: c.month, actual: eur(c.actual!), budget: c.budget === null ? null : eur(c.budget) })) }));
+    }
+    case "fx_overview": {
+      const f = fxActivity(db);
+      return { open_invoices: openForeignInvoices(db).map((o) => ({ journal: `#${o.id}`, date: o.doc_date, supplier: o.counterparty, amount: `${(o.foreign_amount / 100).toFixed(2)} ${o.currency}`, booked_rate: o.fx_rate, booked_eur: eur(o.eur_amount) })), realised_net_gain: eur(f.netGain), settled: f.settled.slice(0, 10).map((x) => ({ journal: `#${x.id}`, invoice: `#${x.settles_id}`, booked_rate: x.booked_rate, paid_rate: x.fx_rate, gain: eur(x.gain) })) };
+    }
+    case "fifo_comparison": {
+      const f = fifoComparison(db);
+      return { inventory_fifo: eur(f.fifoValue), inventory_moving_average: eur(f.avgValue), cogs_to_date_fifo: eur(f.fifoCogs), cogs_to_date_moving_average: eur(f.avgCogs), items: f.rows.map((r) => ({ sku: r.sku, fifo: eur(r.fifoValue), moving_avg: eur(r.avgValue) })) };
+    }
+    case "draft_transaction": {
+      const r = buildDraft(db, input);
+      if (r.error) return { error: r.error };
+      drafts.push({ label: r.label!, href: draftHref(r.draft!) });
+      return { ok: true, prepared: r.label, note: "Draft ready. The user will review and post it with the button shown under your reply. Nothing has been posted." };
+    }
     case "get_overview": {
       const d = dashboard(db);
       return {
@@ -162,6 +290,7 @@ export async function askLedger(db: DB, history: ChatTurn[]): Promise<AssistantR
   const client = new Anthropic();
   const messages: Anthropic.Beta.BetaMessageParam[] = history.slice(-12).map((t) => ({ role: t.role, content: t.text }));
   const used = new Set<string>();
+  const drafts: DraftLink[] = [];
 
   try {
     for (let step = 0; step < 8; step++) {
@@ -186,14 +315,14 @@ export async function askLedger(db: DB, history: ChatTurn[]): Promise<AssistantR
       const toolUses = response.content.filter((b): b is Anthropic.Beta.BetaToolUseBlock => b.type === "tool_use");
       if (response.stop_reason !== "tool_use" || !toolUses.length) {
         const text = response.content.filter((b): b is Anthropic.Beta.BetaTextBlock => b.type === "text").map((b) => b.text).join("\n").trim();
-        return { text: text || "(No answer.)", tools: [...used], mode: "ai" };
+        return { text: text || "(No answer.)", tools: [...used], mode: "ai", drafts };
       }
 
       messages.push({ role: "assistant", content: response.content });
       const results: Anthropic.Beta.BetaToolResultBlockParam[] = toolUses.map((t) => {
         used.add(TOOL_LABEL[t.name] ?? t.name);
         try {
-          return { type: "tool_result", tool_use_id: t.id, content: JSON.stringify(runTool(db, t.name, (t.input ?? {}) as Record<string, unknown>)) };
+          return { type: "tool_result", tool_use_id: t.id, content: JSON.stringify(runTool(db, t.name, (t.input ?? {}) as Record<string, unknown>, drafts)) };
         } catch (e) {
           return { type: "tool_result", tool_use_id: t.id, content: `Error: ${(e as Error).message}`, is_error: true };
         }
@@ -222,6 +351,53 @@ export async function askLedger(db: DB, history: ChatTurn[]): Promise<AssistantR
 function offline(db: DB, q: string): Omit<AssistantReply, "notice"> {
   const s = q.toLowerCase();
   const has = (...w: string[]) => w.some((x) => s.includes(x));
+
+  // "sell 3 ETH-YRG-1K to Café Kranich at 26.90" / "receive 20 COL-HUI-1K at 12.80 from Rösterei Nord"
+  const m = q.match(/\b(sell|sold|receive|received|buy|bought|purchase)\s+(\d+)\s*(?:x\s*|×\s*)?([A-Za-z0-9-]{4,})(?:.*?(?:at|@|for)\s*€?\s*(\d+(?:[.,]\d{1,2})?))?(?:.*?\b(?:to|from)\s+(.+?))?(?:\s+(?:at|@|for)\b.*)?$/i);
+  if (m) {
+    const kind = /sell|sold/i.test(m[1]) ? "SALE" : "RECEIPT";
+    const r = buildDraft(db, { kind, counterparty: m[5]?.trim(), lines: [{ sku: m[3], qty: Number(m[2]), unit_amount: m[4]?.replace(",", ".") }] });
+    if (r.error) return { text: r.error, tools: [TOOL_LABEL.draft_transaction], mode: "offline" };
+    return {
+      text: `I prepared a draft **${r.label}**${m[5] ? ` with ${m[5].trim()}` : ""}${m[4] ? ` at €${m[4]} per unit` : ""}. Review it and post it yourself; nothing has been recorded yet.`,
+      tools: [TOOL_LABEL.draft_transaction],
+      mode: "offline",
+      drafts: [{ label: r.label!, href: draftHref(r.draft!) }],
+    };
+  }
+  if (has("anomal", "unusual", "suspicious", "fraud", "odd", "wrong")) {
+    const a = detectAnomalies(db).filter((x) => x.severity !== "low").slice(0, 6);
+    return {
+      text: a.length ? `**${a.length} flagged item(s)** worth a look:\n${a.map((x) => `- ${x.title} (#${x.journalId}): ${x.detail}`).join("\n")}` : "Nothing unusual stands out: costs, margins and write-offs are all within their normal ranges.",
+      tools: [TOOL_LABEL.find_anomalies],
+      mode: "offline",
+    };
+  }
+  if (has("forecast", "predict", "next month", "next 30", "projection", "stockout", "stock out")) {
+    const c = forecastCash(db);
+    const d = forecastDemand(db).filter((x) => x.stockoutDate).slice(0, 5);
+    return {
+      text: `Cash is projected at **${eur(c.projected)}** in 30 days (80% range ${eur(c.low)} – ${eur(c.high)}).\n${d.length ? `Likely stock-outs:\n${d.map((x) => `- \`${x.sku}\` around ${x.stockoutDate} (needs ~${x.forecast30} ${x.unit}, has ${x.onHand})`).join("\n")}` : "No item is projected to run out within 30 days."}`,
+      tools: [TOOL_LABEL.cash_forecast, TOOL_LABEL.demand_forecast],
+      mode: "offline",
+    };
+  }
+  if (has("vat", "tax")) {
+    const v = vatPosition(db);
+    return {
+      text: `Current VAT position: output **${eur(v.output)}**, input **${eur(v.input)}**, so the net ${v.net >= 0 ? "payable" : "refund"} is **${eur(Math.abs(v.net))}**. Settle it with *New transaction → Cash → Settle VAT*.`,
+      tools: [TOOL_LABEL.vat_summary],
+      mode: "offline",
+    };
+  }
+  if (has("budget", "target", "plan")) {
+    const b = budgetVsActual(db, today().slice(0, 4));
+    return {
+      text: `Year to date vs budget:\n${b.rows.map((r) => `- ${r.code === ACC.REVENUE ? "Revenue" : r.code === ACC.COGS ? "Cost of goods" : "Operating expenses"}: ${eur(r.ytdActual)} vs ${eur(r.ytdBudget)} (${r.ytdVariance >= 0 ? "favourable" : "unfavourable"} by ${eur(Math.abs(r.ytdVariance))})`).join("\n")}`,
+      tools: [TOOL_LABEL.budget_vs_actual],
+      mode: "offline",
+    };
+  }
 
   if (has("reorder", "low stock", "running out", "restock", "out of stock", "buy")) {
     const rows = reorderInsights(db).filter((r) => r.status === "critical" || r.status === "low");
@@ -276,8 +452,93 @@ function offline(db: DB, q: string): Omit<AssistantReply, "notice"> {
     };
   }
   return {
-    text: "In offline mode I can answer questions about **inventory value**, **reorder needs**, **revenue and margin**, **cash and balances**, and **ledger integrity**. Try one of the suggestions below.",
+    text: "In offline mode I can answer questions about **inventory**, **reorder needs**, **revenue and margin**, **cash**, **VAT**, **budgets**, **forecasts**, **anomalies** and **integrity**, and draft entries like *\"sell 3 ETH-YRG-1K to Café Kranich at 26.90\"*.",
     tools: [],
     mode: "offline",
   };
+}
+
+// ───────────────────────── month-end commentary ─────────────────────────
+
+export type Commentary = { id: number; period: string; created_at: string; source: string; text: string; data_hash: string };
+
+export const commentaries = (db: DB, period?: string) =>
+  all<Commentary>(db, `SELECT * FROM commentaries ${period ? "WHERE period = ?" : ""} ORDER BY id DESC LIMIT 24`, ...(period ? [period] : []));
+
+function monthFacts(db: DB, period: string) {
+  const [y, m] = period.split("-").map(Number);
+  const prev = new Date(Date.UTC(y, m - 2, 1)).toISOString().slice(0, 7);
+  const cur = incomeStatement(db, { from: `${period}-01`, asOf: monthEnd(period) });
+  const before = incomeStatement(db, { from: `${prev}-01`, asOf: monthEnd(prev) });
+  const budget = budgetVsActual(db, String(y)).rows.map((r) => {
+    const c = r.cells[m - 1];
+    return { account: r.code, actual: c.actual, budget: c.budget };
+  });
+  const flags = detectAnomalies(db, { since: `${period}-01` }).filter((a) => a.date <= monthEnd(period) && a.severity !== "low").slice(0, 8);
+  const vat = vatReport(db, { from: `${period}-01`, asOf: monthEnd(period) });
+  const top = all<{ sku: string; units: number; revenue: number }>(
+    db,
+    `SELECT i.sku, -SUM(m.qty) units, 0 revenue FROM stock_moves m JOIN journals j ON j.id = m.journal_id JOIN items i ON i.id = m.item_id
+     WHERE j.kind = 'SALE' AND m.doc_date BETWEEN ? AND ? GROUP BY i.sku ORDER BY units DESC LIMIT 3`,
+    `${period}-01`,
+    monthEnd(period),
+  );
+  return {
+    period,
+    closed: (lockedThrough(db) ?? "") >= period,
+    revenue: cur.totalRevenue, revenue_prev: before.totalRevenue,
+    gross_margin: cur.grossMargin, gross_margin_prev: before.grossMargin,
+    opex: cur.totalOpex, fx_net: cur.otherNet, net_income: cur.netIncome, net_income_prev: before.netIncome,
+    budget, vat_net: vat.net, top_sellers: top.map((t) => `${t.sku} (${t.units})`),
+    flags: flags.map((f) => ({ title: f.title, detail: f.detail, journal: f.journalId })),
+  };
+}
+
+function templateCommentary(f: ReturnType<typeof monthFacts>) {
+  const pct = (a: number, b: number) => (b ? `${a >= b ? "+" : ""}${(((a - b) / b) * 100).toFixed(1)}%` : "n/a");
+  const rev = f.budget.find((b) => b.account === ACC.REVENUE);
+  const lines = [
+    `**Summary.** Revenue was ${eur(f.revenue)} (${pct(f.revenue, f.revenue_prev)} vs the prior month) at a ${(f.gross_margin * 100).toFixed(1)}% gross margin (${((f.gross_margin - f.gross_margin_prev) * 100).toFixed(1)} pt). Net income: ${eur(f.net_income)}.`,
+    rev?.budget ? `**Budget.** Revenue came in ${f.revenue >= rev.budget ? "ahead of" : "behind"} budget by ${eur(Math.abs(f.revenue - rev.budget))} (${pct(f.revenue, rev.budget)}).` : "",
+    f.fx_net ? `**FX.** Realised currency ${f.fx_net >= 0 ? "gains" : "losses"} of ${eur(Math.abs(f.fx_net))} on supplier payments.` : "",
+    `**VAT.** Net ${f.vat_net >= 0 ? "payable" : "refundable"} for the month: ${eur(Math.abs(f.vat_net))}.`,
+    f.top_sellers.length ? `**Top sellers.** ${f.top_sellers.join(", ")}.` : "",
+    f.flags.length ? `**Watch-outs.**\n${f.flags.map((x) => `- ${x.title}${x.journal ? ` (#${x.journal})` : ""}`).join("\n")}` : "**Watch-outs.** No significant anomalies were detected.",
+  ];
+  return lines.filter(Boolean).join("\n\n");
+}
+
+/** Writes an AI (or template) month-end commentary and stores it append-only with a hash of its source data. */
+export async function generateCommentary(db: DB, period: string): Promise<Commentary & { notice?: string }> {
+  const facts = monthFacts(db, period);
+  const dataHash = sha256(JSON.stringify(facts));
+  let text = "";
+  let source = "template";
+  let notice: string | undefined;
+  if (hasCredentials()) {
+    try {
+      const client = new Anthropic();
+      const r = await client.beta.messages.create({
+        model: MODEL,
+        max_tokens: 16000,
+        betas: ["server-side-fallback-2026-07-01"],
+        fallbacks: "default",
+        output_config: { effort: "medium" },
+        system:
+          "You write concise month-end management commentary for a small wholesaler's owner. Use only the figures provided (amounts are EUR cents; convert to euros with 2 decimals). 4–6 short paragraphs with bold lead-ins: Summary, Margin, Budget, Cash & VAT, Watch-outs (cite journal ids as #123), Next steps. No preamble.",
+        messages: [{ role: "user", content: `Facts for ${period}:\n${JSON.stringify(facts)}` }],
+      });
+      if (r.stop_reason !== "refusal") {
+        text = r.content.filter((b): b is Anthropic.Beta.BetaTextBlock => b.type === "text").map((b) => b.text).join("\n").trim();
+        source = `claude:${r.model}`;
+      }
+    } catch (e) {
+      if (!(e instanceof Anthropic.APIError)) throw e;
+      notice = "Claude was unavailable, so a template commentary was written instead.";
+    }
+  }
+  if (!text) text = templateCommentary(facts);
+  const at = new Date().toISOString();
+  const res = run(db, "INSERT INTO commentaries (period, created_at, source, text, data_hash) VALUES (?, ?, ?, ?, ?)", period, at, source, text, dataHash);
+  return { id: Number(res.lastInsertRowid), period, created_at: at, source, text, data_hash: dataHash, notice };
 }

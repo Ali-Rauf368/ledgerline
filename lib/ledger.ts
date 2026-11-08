@@ -15,8 +15,8 @@
 import { createHash } from "node:crypto";
 import type { DB } from "./db.ts";
 import { all, get, run } from "./db.ts";
-import { ACC } from "./accounts.ts";
-import type { JournalKind } from "./accounts.ts";
+import { ACC, CURRENCIES, CURRENCY_DECIMALS, VAT_RATES } from "./accounts.ts";
+import type { Currency, JournalKind } from "./accounts.ts";
 
 export class LedgerError extends Error {
   constructor(message: string) {
@@ -37,6 +37,10 @@ export type JournalRow = {
   counterparty: string;
   reverses_id: number | null;
   idempotency_key: string | null;
+  currency?: string | null;
+  fx_rate?: string | null;
+  foreign_amount?: number | null;
+  settles_id?: number | null;
   prev_hash: string;
   hash: string;
 };
@@ -67,6 +71,9 @@ export function computeJournalHash(j: JournalRow, lines: LineRow[], moves: MoveR
     reference: j.reference,
     counterparty: j.counterparty,
     reverses: j.reverses_id ?? null,
+    // v2 fields are only part of the payload when present, so v1 journals keep their original hashes.
+    ...(j.currency ? { fx: [j.currency, j.fx_rate, j.foreign_amount] } : {}),
+    ...(j.settles_id ? { settles: j.settles_id } : {}),
     lines: lines.map((l) => [l.account_code, l.debit, l.credit]),
     moves: moves.map((m) => [m.item_id, m.warehouse_id, m.doc_date, m.qty, m.value, m.qty_after, m.value_after]),
   });
@@ -96,6 +103,33 @@ function assertQty(q: number) {
 
 function assertCents(v: number, label: string) {
   if (!Number.isSafeInteger(v) || v < 0) throw new LedgerError(`${label} must be a non-negative amount.`);
+}
+
+function assertVat(rate: number) {
+  if (!(VAT_RATES as readonly number[]).includes(rate)) throw new LedgerError(`VAT rate must be one of ${VAT_RATES.join(", ")}%.`);
+}
+
+/** VAT on a net amount, rounded half-up to the cent. */
+export const vatOf = (net: number, rate: number) => Math.round((net * rate) / 100);
+
+/** Parse an exchange rate ("EUR per 1 unit of foreign currency") into integer micro-units. */
+export function parseRate(rate: string): bigint {
+  if (!/^\d{1,6}(\.\d{1,6})?$/.test(rate)) throw new LedgerError("Exchange rate must be a positive number with up to 6 decimals, e.g. 0.9234.");
+  const [w, f = ""] = rate.split(".");
+  const micro = BigInt(w) * 1_000_000n + BigInt(f.padEnd(6, "0"));
+  if (micro === 0n) throw new LedgerError("Exchange rate must be greater than zero.");
+  return micro;
+}
+
+/** Convert foreign minor units to EUR cents with exact integer arithmetic (half-up). */
+export function toEur(foreignMinor: number, currency: Currency, rate: string): number {
+  const num = BigInt(foreignMinor) * parseRate(rate) * 100n;
+  const den = 1_000_000n * 10n ** BigInt(CURRENCY_DECIMALS[currency]);
+  return Number((num * 2n + den) / (2n * den));
+}
+
+function assertCurrency(c: string): asserts c is Currency {
+  if (!(CURRENCIES as readonly string[]).includes(c)) throw new LedgerError(`Unsupported currency ${c}.`);
 }
 
 function tx<T>(db: DB, fn: () => T): T {
@@ -224,6 +258,10 @@ type Draft = {
   reversesId?: number;
   idempotencyKey?: string;
   postedAt?: string;
+  currency?: string;
+  fxRate?: string;
+  foreignAmount?: number;
+  settlesId?: number;
   lines: Line[];
   moves: Planned[];
 };
@@ -262,6 +300,10 @@ function commit(db: DB, d: Draft): JournalRow {
     counterparty: (d.counterparty ?? "").trim(),
     reverses_id: d.reversesId ?? null,
     idempotency_key: d.idempotencyKey ?? null,
+    currency: d.currency ?? null,
+    fx_rate: d.currency ? (d.fxRate ?? null) : null,
+    foreign_amount: d.currency ? (d.foreignAmount ?? null) : null,
+    settles_id: d.settlesId ?? null,
     prev_hash: prev?.hash ?? GENESIS_HASH,
     hash: "",
   };
@@ -279,9 +321,11 @@ function commit(db: DB, d: Draft): JournalRow {
 
   run(
     db,
-    `INSERT INTO journals (id, kind, doc_date, posted_at, memo, reference, counterparty, reverses_id, idempotency_key, prev_hash, hash)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    j.id, j.kind, j.doc_date, j.posted_at, j.memo, j.reference, j.counterparty, j.reverses_id, j.idempotency_key, j.prev_hash, j.hash,
+    `INSERT INTO journals (id, kind, doc_date, posted_at, memo, reference, counterparty, reverses_id, idempotency_key,
+       currency, fx_rate, foreign_amount, settles_id, prev_hash, hash)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    j.id, j.kind, j.doc_date, j.posted_at, j.memo, j.reference, j.counterparty, j.reverses_id, j.idempotency_key,
+    j.currency ?? null, j.fx_rate ?? null, j.foreign_amount ?? null, j.settles_id ?? null, j.prev_hash, j.hash,
   );
   for (const l of lineRows) {
     run(db, "INSERT INTO journal_lines (journal_id, account_code, debit, credit) VALUES (?, ?, ?, ?)", j.id, l.account_code, l.debit, l.credit);
@@ -311,26 +355,57 @@ function posting(db: DB, key: string | undefined, build: () => JournalRow): Jour
 
 type Common = { docDate: string; memo?: string; reference?: string; idempotencyKey?: string; postedAt?: string };
 
+/**
+ * Goods in. Unit costs are net of VAT, in the invoice currency's minor units.
+ * Foreign-currency invoices are converted at the given rate (EUR per unit); the foreign amount is kept
+ * on the journal so the payable can later be settled at the then-current rate (realised FX gain/loss).
+ */
 export function postReceipt(
   db: DB,
-  i: Common & { warehouseId: number; supplier: string; paid?: boolean; lines: { itemId: number; qty: number; unitCost: number }[] },
+  i: Common & {
+    warehouseId: number;
+    supplier: string;
+    paid?: boolean;
+    currency?: string;
+    fxRate?: string;
+    lines: { itemId: number; qty: number; unitCost: number; vatRate?: number }[];
+  },
 ) {
   return posting(db, i.idempotencyKey, () => {
     checkPostingDate(db, i.docDate);
     if (!i.lines.length) throw new LedgerError("Add at least one item.");
+    const currency = i.currency && i.currency !== "EUR" ? i.currency : undefined;
+    if (currency) {
+      assertCurrency(currency);
+      if (!i.fxRate) throw new LedgerError(`Enter the ${currency} → EUR exchange rate.`);
+      parseRate(i.fxRate);
+    }
     const p = planner(db, i.docDate);
-    let total = 0;
+    let net = 0;
+    let vat = 0;
+    let foreign = 0;
     for (const l of i.lines) {
       assertCents(l.unitCost, "Unit cost");
-      total += p.inbound(l.itemId, i.warehouseId, l.qty, l.qty * l.unitCost);
+      const rate = l.vatRate ?? 0;
+      assertVat(rate);
+      if (currency && rate) throw new LedgerError("Foreign-currency purchases are imports: enter them with 0% VAT (import VAT is settled at customs).");
+      const lineForeign = l.qty * l.unitCost;
+      const lineNet = currency ? toEur(lineForeign, currency as Currency, i.fxRate!) : lineForeign;
+      foreign += lineForeign;
+      net += p.inbound(l.itemId, i.warehouseId, l.qty, lineNet);
+      vat += vatOf(lineNet, rate);
     }
     return commit(db, {
       ...i,
       kind: "RECEIPT",
       counterparty: i.supplier,
+      currency,
+      fxRate: currency ? i.fxRate : undefined,
+      foreignAmount: currency ? foreign : undefined,
       lines: [
-        { account: ACC.INV, debit: total, credit: 0 },
-        { account: i.paid ? ACC.CASH : ACC.AP, debit: 0, credit: total },
+        { account: ACC.INV, debit: net, credit: 0 },
+        { account: ACC.VAT_IN, debit: vat, credit: 0 },
+        { account: i.paid ? ACC.CASH : ACC.AP, debit: 0, credit: net + vat },
       ],
       moves: p.moves,
     });
@@ -339,26 +414,31 @@ export function postReceipt(
 
 export function postSale(
   db: DB,
-  i: Common & { warehouseId: number; customer: string; paid?: boolean; lines: { itemId: number; qty: number; unitPrice: number }[] },
+  i: Common & { warehouseId: number; customer: string; paid?: boolean; lines: { itemId: number; qty: number; unitPrice: number; vatRate?: number }[] },
 ) {
   return posting(db, i.idempotencyKey, () => {
     checkPostingDate(db, i.docDate);
     if (!i.lines.length) throw new LedgerError("Add at least one item.");
     const p = planner(db, i.docDate);
     let revenue = 0;
+    let vat = 0;
     let cogs = 0;
     for (const l of i.lines) {
       assertCents(l.unitPrice, "Unit price");
+      const rate = l.vatRate ?? 0;
+      assertVat(rate);
       cogs += p.outbound(l.itemId, i.warehouseId, l.qty);
       revenue += l.qty * l.unitPrice;
+      vat += vatOf(l.qty * l.unitPrice, rate);
     }
     return commit(db, {
       ...i,
       kind: "SALE",
       counterparty: i.customer,
       lines: [
-        { account: i.paid ? ACC.CASH : ACC.AR, debit: revenue, credit: 0 },
+        { account: i.paid ? ACC.CASH : ACC.AR, debit: revenue + vat, credit: 0 },
         { account: ACC.REVENUE, debit: 0, credit: revenue },
+        { account: ACC.VAT_OUT, debit: 0, credit: vat },
         { account: ACC.COGS, debit: cogs, credit: 0 },
         { account: ACC.INV, debit: 0, credit: cogs },
       ],
@@ -417,11 +497,29 @@ export function postAdjustment(
   });
 }
 
-export type CashType = "PAY_SUPPLIER" | "RECEIVE_CUSTOMER" | "EXPENSE" | "CAPITAL";
+export type CashType = "PAY_SUPPLIER" | "RECEIVE_CUSTOMER" | "EXPENSE" | "CAPITAL" | "PAY_VAT";
+
+/** Net VAT position: positive = owed to the tax office, negative = refund due. */
+export function vatPosition(db: DB) {
+  const output = 0 - rawBalance(db, ACC.VAT_OUT) || 0;
+  const input = rawBalance(db, ACC.VAT_IN);
+  return { output, input, net: output - input };
+}
 
 export function postCash(db: DB, i: Common & { type: CashType; amount: number; counterparty: string }) {
   return posting(db, i.idempotencyKey, () => {
     checkPostingDate(db, i.docDate);
+    if (i.type === "PAY_VAT") {
+      // Clears both VAT accounts against the bank: the amount is always the exact net position.
+      const v = vatPosition(db);
+      if (!v.output && !v.input) throw new LedgerError("There is no VAT to settle.");
+      const lines: Line[] = [
+        { account: ACC.VAT_OUT, debit: v.output, credit: 0 },
+        { account: ACC.VAT_IN, debit: 0, credit: v.input },
+        v.net >= 0 ? { account: ACC.CASH, debit: 0, credit: v.net } : { account: ACC.CASH, debit: -v.net, credit: 0 },
+      ];
+      return commit(db, { ...i, kind: "PAYMENT", counterparty: i.counterparty || "Finanzamt", memo: i.memo || "VAT settlement", lines, moves: [] });
+    }
     assertCents(i.amount, "Amount");
     if (i.amount === 0) throw new LedgerError("Amount must be greater than zero.");
     const pair: Record<CashType, [string, string]> = {
@@ -429,6 +527,7 @@ export function postCash(db: DB, i: Common & { type: CashType; amount: number; c
       RECEIVE_CUSTOMER: [ACC.CASH, ACC.AR],
       EXPENSE: [ACC.OPEX, ACC.CASH],
       CAPITAL: [ACC.CASH, ACC.EQUITY],
+      PAY_VAT: [ACC.VAT_OUT, ACC.CASH],
     };
     if (i.type === "PAY_SUPPLIER" && i.amount > -rawBalance(db, ACC.AP)) {
       throw new LedgerError("That's more than is owed to suppliers.");
@@ -449,6 +548,68 @@ export function postCash(db: DB, i: Common & { type: CashType; amount: number; c
   });
 }
 
+export type OpenForeignInvoice = {
+  id: number;
+  doc_date: string;
+  counterparty: string;
+  reference: string;
+  currency: Currency;
+  fx_rate: string;
+  foreign_amount: number;
+  eur_amount: number;
+};
+
+/** Foreign-currency receipts on account that are neither reversed nor settled (by an un-reversed settlement). */
+export function openForeignInvoices(db: DB): OpenForeignInvoice[] {
+  return all<OpenForeignInvoice>(
+    db,
+    `SELECT j.id, j.doc_date, j.counterparty, j.reference, j.currency, j.fx_rate, j.foreign_amount,
+            (SELECT credit FROM journal_lines WHERE journal_id = j.id AND account_code = ?) eur_amount
+     FROM journals j
+     WHERE j.kind = 'RECEIPT' AND j.currency IS NOT NULL
+       AND EXISTS (SELECT 1 FROM journal_lines WHERE journal_id = j.id AND account_code = ?)
+       AND NOT EXISTS (SELECT 1 FROM journals r WHERE r.reverses_id = j.id)
+       AND NOT EXISTS (SELECT 1 FROM journals s WHERE s.settles_id = j.id AND NOT EXISTS (SELECT 1 FROM journals rr WHERE rr.reverses_id = s.id))
+     ORDER BY j.id`,
+    ACC.AP,
+    ACC.AP,
+  );
+}
+
+/**
+ * Pays a foreign-currency invoice in full at today's rate. The payable is cleared at its booked EUR value;
+ * the difference to what the bank actually paid is a realised FX gain or loss.
+ */
+export function settleForeignInvoice(db: DB, i: Common & { receiptId: number; fxRate: string }) {
+  return posting(db, i.idempotencyKey, () => {
+    checkPostingDate(db, i.docDate);
+    const inv = openForeignInvoices(db).find((o) => o.id === i.receiptId);
+    if (!inv) throw new LedgerError(`Journal #${i.receiptId} is not an open foreign-currency invoice.`);
+    if (i.docDate < inv.doc_date) throw new LedgerError("A payment cannot be dated before its invoice.");
+    const paid = toEur(inv.foreign_amount, inv.currency, i.fxRate);
+    const diff = paid - inv.eur_amount;
+    const lines: Line[] = [
+      { account: ACC.AP, debit: inv.eur_amount, credit: 0 },
+      { account: ACC.CASH, debit: 0, credit: paid },
+    ];
+    if (diff > 0) lines.push({ account: ACC.FX_LOSS, debit: diff, credit: 0 });
+    if (diff < 0) lines.push({ account: ACC.FX_GAIN, debit: 0, credit: -diff });
+    return commit(db, {
+      ...i,
+      kind: "PAYMENT",
+      counterparty: inv.counterparty,
+      reference: i.reference || inv.reference,
+      memo: i.memo || `Settles #${inv.id} (${inv.currency} at ${i.fxRate}, booked at ${inv.fx_rate})`,
+      currency: inv.currency,
+      fxRate: i.fxRate,
+      foreignAmount: inv.foreign_amount,
+      settlesId: inv.id,
+      lines,
+      moves: [],
+    });
+  });
+}
+
 /**
  * Corrects a posted journal without touching it: posts its exact mirror image, dated in an open period.
  * If moving-average cost has shifted since, the difference goes to "Inventory cost variance" so
@@ -464,6 +625,13 @@ export function reverseJournal(
     const orig = get<JournalRow>(db, "SELECT * FROM journals WHERE id = ?", i.journalId);
     if (!orig) throw new LedgerError(`Journal #${i.journalId} does not exist.`);
     if (orig.kind === "REVERSAL") throw new LedgerError("A reversal can't be reversed. Post a new transaction instead.");
+    if (orig.kind === "CLOSING") throw new LedgerError("Year-end closing entries are part of a sealed year and can't be reversed.");
+    const settlement = get<{ id: number }>(
+      db,
+      "SELECT s.id FROM journals s WHERE s.settles_id = ? AND NOT EXISTS (SELECT 1 FROM journals r WHERE r.reverses_id = s.id)",
+      orig.id,
+    );
+    if (settlement) throw new LedgerError(`This invoice was paid by #${settlement.id}. Reverse that payment first.`);
     const already = get<{ id: number }>(db, "SELECT id FROM journals WHERE reverses_id = ?", orig.id);
     if (already) throw new LedgerError(`Journal #${orig.id} was already reversed by #${already.id}.`);
     if (i.docDate < orig.doc_date) throw new LedgerError("A reversal cannot be dated before the original entry.");
@@ -540,6 +708,8 @@ export function closePeriod(db: DB, period: string, actor: string, closedAt?: st
     if (period !== expected) {
       throw new LedgerError(expected ? `Periods close in order: close ${expected} first.` : `${period} can't be closed yet.`);
     }
+    let closingId: number | null = null;
+    if (period.endsWith("-12")) closingId = postYearEndClose(db, period.slice(0, 4), closedAt);
     const snapshot = JSON.stringify(periodSnapshot(db, period));
     const hash = sha256(snapshot);
     const last = get<{ id: number | null }>(db, "SELECT MAX(id) id FROM journals")!.id ?? 0;
@@ -549,8 +719,37 @@ export function closePeriod(db: DB, period: string, actor: string, closedAt?: st
       period, closedAt ?? new Date().toISOString(), actor, last, snapshot, hash,
     );
     audit(db, actor, "PERIOD_CLOSED", `${period} sealed with snapshot ${hash.slice(0, 16)}… (through journal #${last})`);
-    return { period, hash };
+    if (closingId) audit(db, actor, "YEAR_CLOSED", `FY${period.slice(0, 4)} profit transferred to retained earnings by #${closingId}`);
+    return { period, hash, closingId };
   });
+}
+
+/**
+ * Year-end: zero every revenue and expense account for the year into Retained earnings,
+ * dated 31 Dec. Runs inside closePeriod's transaction, before December is sealed.
+ */
+function postYearEndClose(db: DB, year: string, postedAt?: string): number | null {
+  const end = `${year}-12-31`;
+  const balances = all<{ code: string; bal: number }>(
+    db,
+    `SELECT l.account_code code, SUM(l.debit - l.credit) bal
+     FROM journal_lines l JOIN journals j ON j.id = l.journal_id JOIN accounts a ON a.code = l.account_code
+     WHERE j.doc_date <= ? AND a.type IN ('REVENUE', 'EXPENSE')
+     GROUP BY l.account_code HAVING bal <> 0 ORDER BY l.account_code`,
+    end,
+  );
+  if (!balances.length) return null;
+  const lines: Line[] = balances.map((b) => (b.bal > 0 ? { account: b.code, debit: 0, credit: b.bal } : { account: b.code, debit: -b.bal, credit: 0 }));
+  const profit = -balances.reduce((s, b) => s + b.bal, 0);
+  lines.push(profit >= 0 ? { account: ACC.RETAINED, debit: 0, credit: profit } : { account: ACC.RETAINED, debit: -profit, credit: 0 });
+  return commit(db, {
+    kind: "CLOSING",
+    docDate: end,
+    postedAt,
+    memo: `FY${year} close: ${profit >= 0 ? "profit" : "loss"} of ${(Math.abs(profit) / 100).toFixed(2)} EUR to retained earnings`,
+    lines,
+    moves: [],
+  }).id;
 }
 
 // ───────────────────────── master data ─────────────────────────
@@ -560,16 +759,40 @@ export function createWarehouse(db: DB, code: string, name: string) {
   return Number(r.lastInsertRowid);
 }
 
-export function createItem(db: DB, i: { sku: string; name: string; unit?: string; category?: string }, actor = "system") {
+export function createItem(db: DB, i: { sku: string; name: string; unit?: string; category?: string; vatRate?: number }, actor = "system") {
   const sku = i.sku.trim().toUpperCase();
   if (!/^[A-Z0-9][A-Z0-9-]{1,23}$/.test(sku)) throw new LedgerError("SKU: 2–24 characters, letters, digits and dashes.");
   if (!i.name.trim()) throw new LedgerError("Give the item a name.");
+  assertVat(i.vatRate ?? 19);
   if (get(db, "SELECT id FROM items WHERE sku = ?", sku)) throw new LedgerError(`SKU ${sku} already exists.`);
   const r = run(
     db,
-    "INSERT INTO items (sku, name, unit, category, created_at) VALUES (?, ?, ?, ?, ?)",
-    sku, i.name.trim(), i.unit?.trim() || "pcs", i.category?.trim() || "General", new Date().toISOString(),
+    "INSERT INTO items (sku, name, unit, category, vat_rate, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    sku, i.name.trim(), i.unit?.trim() || "pcs", i.category?.trim() || "General", i.vatRate ?? 19, new Date().toISOString(),
   );
   audit(db, actor, "ITEM_CREATED", `${sku} · ${i.name.trim()}`);
   return Number(r.lastInsertRowid);
+}
+
+// ───────────────────────── budgets ─────────────────────────
+
+/** Budgets are versioned, not edited: each save appends a row and the latest row per month/account wins. */
+export function setBudget(db: DB, entries: { period: string; account: string; amount: number }[], actor: string) {
+  return tx(db, () => {
+    const at = new Date().toISOString();
+    let changed = 0;
+    for (const e of entries) {
+      if (!/^\d{4}-\d{2}$/.test(e.period)) throw new LedgerError("Budget period must be YYYY-MM.");
+      assertCents(e.amount, "Budget amount");
+      if (!get(db, "SELECT code FROM accounts WHERE code = ? AND type IN ('REVENUE','EXPENSE')", e.account)) {
+        throw new LedgerError(`Budgets can only be set for revenue and expense accounts (${e.account}).`);
+      }
+      const cur = get<{ amount: number }>(db, "SELECT amount FROM budget_entries WHERE period = ? AND account_code = ? ORDER BY id DESC LIMIT 1", e.period, e.account);
+      if (cur?.amount === e.amount) continue;
+      run(db, "INSERT INTO budget_entries (period, account_code, amount, created_at, created_by) VALUES (?, ?, ?, ?, ?)", e.period, e.account, e.amount, at, actor);
+      changed++;
+    }
+    if (changed) audit(db, actor, "BUDGET_UPDATED", `${changed} budget figure(s) changed`);
+    return changed;
+  });
 }

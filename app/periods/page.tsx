@@ -1,6 +1,8 @@
 import Link from "next/link";
 import { CalendarClock, Lock, LockOpen } from "lucide-react";
 import { ClosePeriodButton } from "@/components/forms";
+import { GenerateCommentaryButton } from "@/components/ai-forms";
+import { commentaries } from "@/lib/assistant";
 import { Badge, Card, Money, PageHeader } from "@/components/ui";
 import { getDb } from "@/lib/db";
 import { verifyLedger } from "@/lib/integrity";
@@ -13,13 +15,15 @@ export default function PeriodsPage() {
   const periods = periodsOverview(db);
   const lock = lockedThrough(db);
   const snapshotsOk = verifyLedger(db).checks.find((c) => c.id === "periods")!.ok;
+  const notes = new Map<string, number>();
+  for (const c of commentaries(db)) if (!notes.has(c.period)) notes.set(c.period, c.id);
 
   return (
     <>
       <PageHeader
         eyebrow="Period control"
         title="Accounting periods"
-        subtitle="Closing a month locks it permanently and seals a SHA-256 snapshot of every balance. Later corrections go into an open month, so reported history never moves."
+        subtitle="Closing a month locks it permanently and seals a SHA-256 snapshot of every balance. Closing December also posts the year-end entry that moves the year's profit into retained earnings."
         actions={lock ? <Badge tone="accent" className="px-3! py-1.5! text-xs!"><Lock className="size-3.5" /> Books locked through {fmtMonth(lock)}</Badge> : undefined}
       />
 
@@ -43,6 +47,8 @@ export default function PeriodsPage() {
                     {p.status === "current" && <Badge>Current month</Badge>}
                     {p.status === "open" && <Badge>Open</Badge>}
                     {p.close && <Badge tone={snapshotsOk ? "pos" : "neg"}>{snapshotsOk ? "Snapshot verified" : "Snapshot mismatch"}</Badge>}
+                    {p.close && p.period.endsWith("-12") && <Badge tone="accent">FY{p.period.slice(0, 4)} closed to retained earnings</Badge>}
+                    {notes.has(p.period) && <Link href="/insights"><Badge tone="accent">AI commentary</Badge></Link>}
                   </div>
                   <p className="mt-1 text-xs text-muted">
                     <Link href={`/reports?tab=pl&from=${p.period}-01&asOf=${p.end}`} className="hover:text-accent">
@@ -50,7 +56,10 @@ export default function PeriodsPage() {
                     </Link>
                   </p>
                 </div>
-                {p.status === "closable" && <ClosePeriodButton period={p.period} />}
+                <div className="flex flex-wrap items-center gap-2">
+                  {p.status !== "current" && p.journals > 0 && <GenerateCommentaryButton period={p.period} label={notes.has(p.period) ? "Rewrite commentary" : "AI commentary"} />}
+                  {p.status === "closable" && <ClosePeriodButton period={p.period} />}
+                </div>
                 {p.status === "current" && <p className="text-xs text-muted">Can be closed after {fmtDate(p.end)}</p>}
               </div>
               {p.close && (

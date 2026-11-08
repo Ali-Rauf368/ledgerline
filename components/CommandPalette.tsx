@@ -64,6 +64,11 @@ export function CommandPalette({ data }: { data: PaletteData }) {
       { id: "p-bs", label: "Balance sheet", group: "Go to", icon: FileBarChart, run: go("/reports?tab=bs") },
       { id: "p-tb", label: "Trial balance", group: "Go to", icon: FileBarChart, run: go("/reports?tab=tb") },
       { id: "p-val", label: "Inventory valuation", group: "Go to", icon: FileBarChart, run: go("/reports?tab=inv") },
+      { id: "p-ins", label: "Insights: anomalies & forecasts", group: "Go to", icon: Sparkles, run: go("/insights"), keywords: "ai anomaly forecast commentary" },
+      { id: "p-bud", label: "Budgets", group: "Go to", icon: FileBarChart, run: go("/budgets"), keywords: "plan target variance" },
+      { id: "p-vat", label: "VAT return", group: "Go to", icon: FileBarChart, run: go("/reports?tab=vat"), keywords: "tax" },
+      { id: "p-fx", label: "Foreign currency invoices", group: "Go to", icon: FileBarChart, run: go("/reports?tab=fx"), keywords: "fx usd exchange" },
+      { id: "p-fifo", label: "FIFO vs moving average", group: "Go to", icon: FileBarChart, run: go("/reports?tab=fifo"), keywords: "costing" },
       { id: "p-per", label: "Periods", group: "Go to", icon: CalendarCheck, run: go("/periods") },
       { id: "p-aud", label: "Audit log", group: "Go to", icon: ScrollText, run: go("/audit") },
     ];
