@@ -1,0 +1,161 @@
+import Link from "next/link";
+import { notFound } from "next/navigation";
+import { ArrowLeft, Link2, Lock } from "lucide-react";
+import { ReverseForm } from "@/components/forms";
+import { Badge, Card, CardHeader, KindBadge, Money, PageHeader } from "@/components/ui";
+import { getDb } from "@/lib/db";
+import { computeJournalHash, today } from "@/lib/ledger";
+import { all } from "@/lib/db";
+import type { LineRow, MoveRow } from "@/lib/ledger";
+import { fmtDate, fmtQty, fmtTimestamp } from "@/lib/money";
+import { journalDetail } from "@/lib/reports";
+
+export default async function JournalDetailPage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const db = getDb();
+  const d = journalDetail(db, Number(id));
+  if (!d) notFound();
+  const { journal: j, lines, moves } = d;
+
+  const rawLines = all<LineRow>(db, "SELECT account_code, debit, credit FROM journal_lines WHERE journal_id = ? ORDER BY id", j.id);
+  const rawMoves = all<MoveRow>(db, "SELECT * FROM stock_moves WHERE journal_id = ? ORDER BY id", j.id);
+  const hashOk = computeJournalHash(j as never, rawLines, rawMoves) === j.hash;
+  const debits = lines.reduce((s, l) => s + l.debit, 0);
+  const credits = lines.reduce((s, l) => s + l.credit, 0);
+  const canReverse = j.kind !== "REVERSAL" && !j.reversed_by;
+
+  return (
+    <>
+      <Link href="/transactions" className="mb-4 inline-flex items-center gap-1.5 text-xs font-medium text-muted hover:text-ink">
+        <ArrowLeft className="size-3.5" /> Journal
+      </Link>
+      <PageHeader
+        eyebrow={`Journal #${j.id}`}
+        title={j.counterparty || j.memo || `Journal #${j.id}`}
+        subtitle={j.counterparty && j.memo ? j.memo : undefined}
+        actions={
+          <div className="flex flex-wrap items-center gap-2">
+            <KindBadge kind={j.kind} />
+            {j.reversed_by && <Link href={`/transactions/${j.reversed_by}`}><Badge tone="neg">Reversed by #{j.reversed_by}</Badge></Link>}
+            {j.reverses_id && <Link href={`/transactions/${j.reverses_id}`}><Badge tone="warn">Reverses #{j.reverses_id}</Badge></Link>}
+            {d.lockedPeriod && <Badge><Lock className="size-3" /> Closed period</Badge>}
+          </div>
+        }
+      />
+
+      <div className="grid gap-6 xl:grid-cols-[1fr_340px]">
+        <div className="space-y-6">
+          <Card>
+            <CardHeader title="General ledger lines" subtitle={lines.length ? "Debits always equal credits" : "Transfers move value between locations and have no GL impact"} />
+            {lines.length > 0 && (
+              <div className="overflow-x-auto">
+                <table className="table">
+                  <thead>
+                    <tr><th>Account</th><th className="text-right!">Debit</th><th className="text-right!">Credit</th></tr>
+                  </thead>
+                  <tbody>
+                    {lines.map((l, i) => (
+                      <tr key={i}>
+                        <td className={l.credit ? "pl-10!" : ""}>
+                          <span className="font-mono text-xs text-muted">{l.account_code}</span> <span className="text-ink">{l.name}</span>
+                        </td>
+                        <td className="text-right">{l.debit ? <Money cents={l.debit} /> : ""}</td>
+                        <td className="text-right">{l.credit ? <Money cents={l.credit} /> : ""}</td>
+                      </tr>
+                    ))}
+                    <tr className="bg-surface-2/50 font-semibold">
+                      <td className="text-xs text-muted">{debits === credits ? "Balanced ✓" : "UNBALANCED"}</td>
+                      <td className="text-right"><Money cents={debits} /></td>
+                      <td className="text-right"><Money cents={credits} /></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Card>
+
+          {moves.length > 0 && (
+            <Card>
+              <CardHeader title="Stock movements" subtitle="Each carries the resulting position, which is never recomputed later" />
+              <div className="overflow-x-auto">
+                <table className="table min-w-[680px]">
+                  <thead>
+                    <tr>
+                      <th>Item</th><th>Wh</th>
+                      <th className="text-right!">Qty</th><th className="text-right!">Unit cost</th><th className="text-right!">Value</th>
+                      <th className="text-right!">Position after</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {moves.map((m, i) => (
+                      <tr key={i}>
+                        <td>
+                          <Link href={`/inventory/${m.item_id}`} className="hover:text-accent">
+                            <span className="block text-ink">{m.name}</span>
+                            <span className="font-mono text-[11px] text-muted">{m.sku}</span>
+                          </Link>
+                        </td>
+                        <td className="font-mono text-xs text-muted">{m.wh_code}</td>
+                        <td className={`num text-right font-medium ${m.qty > 0 ? "text-pos" : "text-neg"}`}>{m.qty > 0 ? "+" : ""}{fmtQty(m.qty)}</td>
+                        <td className="text-right text-muted"><Money cents={Math.round(Math.abs(m.value / m.qty))} /></td>
+                        <td className="text-right"><Money cents={m.value} colored /></td>
+                        <td className="num text-right text-muted">{fmtQty(m.qty_after)} · <Money cents={m.value_after} className="text-ink" /></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          )}
+        </div>
+
+        <div className="space-y-6">
+          <Card className="p-5">
+            <h2 className="text-sm font-semibold">Record</h2>
+            <dl className="mt-4 space-y-3 text-sm">
+              {[
+                ["Document date", fmtDate(j.doc_date)],
+                ["Posted at", fmtTimestamp(j.posted_at)],
+                ["Reference", j.reference || "—"],
+                ["Idempotency key", j.idempotency_key ? <code key="k" className="font-mono text-[11px]">{j.idempotency_key.slice(0, 18)}…</code> : "—"],
+              ].map(([k, v]) => (
+                <div key={String(k)} className="flex justify-between gap-4">
+                  <dt className="text-muted">{k}</dt>
+                  <dd className="text-right text-ink">{v}</dd>
+                </div>
+              ))}
+            </dl>
+          </Card>
+
+          <Card className="p-5">
+            <div className="flex items-center justify-between">
+              <h2 className="flex items-center gap-2 text-sm font-semibold"><Link2 className="size-4 text-accent" /> Hash chain</h2>
+              <Badge tone={hashOk ? "pos" : "neg"}>{hashOk ? "Content verified" : "Hash mismatch"}</Badge>
+            </div>
+            <div className="mt-4 space-y-3">
+              <div>
+                <p className="label">Previous</p>
+                {j.id > 1 ? (
+                  <Link href={`/transactions/${j.id - 1}`} className="block break-all font-mono text-[11px] text-muted hover:text-accent">{j.prev_hash}</Link>
+                ) : (
+                  <p className="break-all font-mono text-[11px] text-muted">{j.prev_hash} (genesis)</p>
+                )}
+              </div>
+              <div>
+                <p className="label">This entry, SHA-256(previous | content)</p>
+                <p className="break-all rounded-lg bg-surface-2 p-2.5 font-mono text-[11px] text-ink">{j.hash}</p>
+              </div>
+            </div>
+          </Card>
+
+          {canReverse && (
+            <Card className="p-5">
+              <h2 className="mb-3 text-sm font-semibold">Correct this entry</h2>
+              <ReverseForm journalId={j.id} today={today()} />
+            </Card>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
