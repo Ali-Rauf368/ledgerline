@@ -41,6 +41,11 @@ export type JournalRow = {
   fx_rate?: string | null;
   foreign_amount?: number | null;
   settles_id?: number | null;
+  created_by?: number | null;
+  approved_by?: number | null;
+  contact_id?: number | null;
+  due_date?: string | null;
+  order_id?: number | null;
   prev_hash: string;
   hash: string;
 };
@@ -74,6 +79,12 @@ export function computeJournalHash(j: JournalRow, lines: LineRow[], moves: MoveR
     // v2 fields are only part of the payload when present, so v1 journals keep their original hashes.
     ...(j.currency ? { fx: [j.currency, j.fx_rate, j.foreign_amount] } : {}),
     ...(j.settles_id ? { settles: j.settles_id } : {}),
+    // v3: who posted/approved it and the business document it belongs to.
+    ...(j.created_by ? { by: j.created_by } : {}),
+    ...(j.approved_by ? { approvedBy: j.approved_by } : {}),
+    ...(j.contact_id ? { contact: j.contact_id } : {}),
+    ...(j.due_date ? { due: j.due_date } : {}),
+    ...(j.order_id ? { order: j.order_id } : {}),
     lines: lines.map((l) => [l.account_code, l.debit, l.credit]),
     moves: moves.map((m) => [m.item_id, m.warehouse_id, m.doc_date, m.qty, m.value, m.qty_after, m.value_after]),
   });
@@ -262,6 +273,11 @@ type Draft = {
   fxRate?: string;
   foreignAmount?: number;
   settlesId?: number;
+  actorId?: number;
+  approvedBy?: number;
+  contactId?: number;
+  dueDate?: string;
+  orderId?: number;
   lines: Line[];
   moves: Planned[];
 };
@@ -304,6 +320,11 @@ function commit(db: DB, d: Draft): JournalRow {
     fx_rate: d.currency ? (d.fxRate ?? null) : null,
     foreign_amount: d.currency ? (d.foreignAmount ?? null) : null,
     settles_id: d.settlesId ?? null,
+    created_by: d.actorId ?? null,
+    approved_by: d.approvedBy ?? null,
+    contact_id: d.contactId ?? null,
+    due_date: d.dueDate ?? null,
+    order_id: d.orderId ?? null,
     prev_hash: prev?.hash ?? GENESIS_HASH,
     hash: "",
   };
@@ -322,10 +343,11 @@ function commit(db: DB, d: Draft): JournalRow {
   run(
     db,
     `INSERT INTO journals (id, kind, doc_date, posted_at, memo, reference, counterparty, reverses_id, idempotency_key,
-       currency, fx_rate, foreign_amount, settles_id, prev_hash, hash)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       currency, fx_rate, foreign_amount, settles_id, created_by, approved_by, contact_id, due_date, order_id, prev_hash, hash)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     j.id, j.kind, j.doc_date, j.posted_at, j.memo, j.reference, j.counterparty, j.reverses_id, j.idempotency_key,
-    j.currency ?? null, j.fx_rate ?? null, j.foreign_amount ?? null, j.settles_id ?? null, j.prev_hash, j.hash,
+    j.currency ?? null, j.fx_rate ?? null, j.foreign_amount ?? null, j.settles_id ?? null,
+    j.created_by ?? null, j.approved_by ?? null, j.contact_id ?? null, j.due_date ?? null, j.order_id ?? null, j.prev_hash, j.hash,
   );
   for (const l of lineRows) {
     run(db, "INSERT INTO journal_lines (journal_id, account_code, debit, credit) VALUES (?, ?, ?, ?)", j.id, l.account_code, l.debit, l.credit);
@@ -351,9 +373,131 @@ function posting(db: DB, key: string | undefined, build: () => JournalRow): Jour
   });
 }
 
+// ───────────────────────── contacts, invoices, orders ─────────────────────────
+
+export type ContactKind = "CUSTOMER" | "SUPPLIER";
+type ContactRow = { id: number; kind: ContactKind; name: string; terms_days: number; currency: string };
+
+function contactFor(db: DB, id: number | undefined, kind: ContactKind): ContactRow | undefined {
+  if (!id) return undefined;
+  const c = get<ContactRow>(db, "SELECT id, kind, name, terms_days, currency FROM contacts WHERE id = ?", id);
+  if (!c) throw new LedgerError(`Unknown contact #${id}.`);
+  if (c.kind !== kind) throw new LedgerError(`${c.name} is a ${c.kind.toLowerCase()}, not a ${kind.toLowerCase()}.`);
+  return c;
+}
+
+export const addDaysIso = (d: string, n: number) => new Date(Date.parse(`${d}T00:00:00Z`) + n * 86400000).toISOString().slice(0, 10);
+
+/** Remaining quantity per item on an order (ordered − delivered by un-reversed journals). */
+export function orderRemaining(db: DB, orderId: number) {
+  const lines = all<{ item_id: number; qty: number }>(db, "SELECT item_id, SUM(qty) qty FROM order_lines WHERE order_id = ? GROUP BY item_id", orderId);
+  const done = all<{ item_id: number; qty: number }>(
+    db,
+    `SELECT m.item_id, SUM(ABS(m.qty)) qty FROM stock_moves m JOIN journals j ON j.id = m.journal_id
+     WHERE j.order_id = ? AND NOT EXISTS (SELECT 1 FROM journals r WHERE r.reverses_id = j.id) GROUP BY m.item_id`,
+    orderId,
+  );
+  return new Map(lines.map((l) => [l.item_id, l.qty - (done.find((d) => d.item_id === l.item_id)?.qty ?? 0)]));
+}
+
+function checkOrder(db: DB, orderId: number | undefined, kind: "PO" | "SO", contactId: number | undefined, lines: { itemId: number; qty: number }[]) {
+  if (!orderId) return;
+  const o = get<{ kind: string; contact_id: number; cancelled_at: string | null; number: string }>(db, "SELECT kind, contact_id, cancelled_at, number FROM orders WHERE id = ?", orderId);
+  if (!o) throw new LedgerError(`Unknown order #${orderId}.`);
+  if (o.kind !== kind) throw new LedgerError(`${o.number} is not a ${kind === "PO" ? "purchase" : "sales"} order.`);
+  if (o.cancelled_at) throw new LedgerError(`${o.number} was cancelled.`);
+  if (contactId && o.contact_id !== contactId) throw new LedgerError(`${o.number} belongs to a different ${kind === "PO" ? "supplier" : "customer"}.`);
+  const remaining = orderRemaining(db, orderId);
+  const want = new Map<number, number>();
+  for (const l of lines) want.set(l.itemId, (want.get(l.itemId) ?? 0) + l.qty);
+  for (const [item, qty] of want) {
+    const left = remaining.get(item);
+    if (left === undefined) throw new LedgerError(`Item #${item} is not on ${o.number}.`);
+    if (qty > left) throw new LedgerError(`${o.number} has only ${left} left to ${kind === "PO" ? "receive" : "deliver"} for item #${item}, not ${qty}.`);
+  }
+}
+
+export type OpenInvoice = {
+  id: number;
+  kind: "SALE" | "RECEIPT";
+  doc_date: string;
+  due_date: string | null;
+  contact_id: number | null;
+  counterparty: string;
+  reference: string;
+  gross: number;
+  paid: number;
+  open: number;
+  currency: string | null;
+};
+
+/**
+ * Open receivables (sales on account) or payables (receipts on account): gross on the AR/AP line minus
+ * allocations from payments that were not reversed. Reversed invoices drop out entirely.
+ */
+export function openInvoices(db: DB, o: { side: "AR" | "AP"; contactId?: number; includeSettled?: boolean }): OpenInvoice[] {
+  const acc = o.side === "AR" ? ACC.AR : ACC.AP;
+  const col = o.side === "AR" ? "debit" : "credit";
+  const rows = all<OpenInvoice>(
+    db,
+    `SELECT j.id, j.kind, j.doc_date, j.due_date, j.contact_id, j.counterparty, j.reference, j.currency,
+       (SELECT SUM(${col}) FROM journal_lines WHERE journal_id = j.id AND account_code = ?) gross,
+       COALESCE((SELECT SUM(a.amount) FROM allocations a WHERE a.invoice_id = j.id
+                 AND NOT EXISTS (SELECT 1 FROM journals r WHERE r.reverses_id = a.payment_id)), 0) paid,
+       0 open
+     FROM journals j
+     WHERE j.kind = ? AND EXISTS (SELECT 1 FROM journal_lines x WHERE x.journal_id = j.id AND x.account_code = ? AND x.${col} > 0)
+       AND NOT EXISTS (SELECT 1 FROM journals r WHERE r.reverses_id = j.id)
+       AND (? IS NULL OR j.contact_id = ?)
+     ORDER BY COALESCE(j.due_date, j.doc_date), j.id`,
+    acc,
+    o.side === "AR" ? "SALE" : "RECEIPT",
+    acc,
+    o.contactId ?? null,
+    o.contactId ?? null,
+  );
+  return rows.map((r) => ({ ...r, open: r.gross - r.paid })).filter((r) => o.includeSettled || r.open > 0);
+}
+
+/** Apply a payment to invoices: explicit ones first (in the given order), otherwise oldest due first. */
+function allocate(db: DB, paymentId: number, side: "AR" | "AP", contactId: number | undefined, amount: number, invoiceIds?: number[]) {
+  let left = amount;
+  const candidates = openInvoices(db, { side, contactId });
+  const ordered = invoiceIds?.length
+    ? invoiceIds.map((id) => {
+        const inv = candidates.find((c) => c.id === id);
+        if (!inv) throw new LedgerError(`Invoice #${id} is not open${contactId ? " for this contact" : ""}.`);
+        return inv;
+      })
+    : contactId
+      ? candidates
+      : [];
+  for (const inv of ordered) {
+    if (left <= 0) break;
+    const take = Math.min(left, inv.open);
+    if (take > 0) run(db, "INSERT INTO allocations (payment_id, invoice_id, amount) VALUES (?, ?, ?)", paymentId, inv.id, take);
+    left -= take;
+  }
+  return amount - left;
+}
+
 // ───────────────────────── public posting API ─────────────────────────
 
-type Common = { docDate: string; memo?: string; reference?: string; idempotencyKey?: string; postedAt?: string };
+type Common = {
+  docDate: string;
+  memo?: string;
+  reference?: string;
+  idempotencyKey?: string;
+  postedAt?: string;
+  /** User who posted it, and (for four-eyes postings) who approved it. */
+  actorId?: number;
+  approvedBy?: number;
+  /** Customer/supplier and sales/purchase order the entry belongs to. */
+  contactId?: number;
+  orderId?: number;
+  /** Due date for invoices on account; defaults to the contact's payment terms. */
+  dueDate?: string;
+};
 
 /**
  * Goods in. Unit costs are net of VAT, in the invoice currency's minor units.
@@ -374,6 +518,8 @@ export function postReceipt(
   return posting(db, i.idempotencyKey, () => {
     checkPostingDate(db, i.docDate);
     if (!i.lines.length) throw new LedgerError("Add at least one item.");
+    const supplier = contactFor(db, i.contactId, "SUPPLIER");
+    checkOrder(db, i.orderId, "PO", i.contactId, i.lines);
     const currency = i.currency && i.currency !== "EUR" ? i.currency : undefined;
     if (currency) {
       assertCurrency(currency);
@@ -398,7 +544,8 @@ export function postReceipt(
     return commit(db, {
       ...i,
       kind: "RECEIPT",
-      counterparty: i.supplier,
+      counterparty: i.supplier || supplier?.name || "",
+      dueDate: i.paid ? undefined : (i.dueDate ?? (supplier ? addDaysIso(i.docDate, supplier.terms_days) : undefined)),
       currency,
       fxRate: currency ? i.fxRate : undefined,
       foreignAmount: currency ? foreign : undefined,
@@ -419,6 +566,8 @@ export function postSale(
   return posting(db, i.idempotencyKey, () => {
     checkPostingDate(db, i.docDate);
     if (!i.lines.length) throw new LedgerError("Add at least one item.");
+    const customer = contactFor(db, i.contactId, "CUSTOMER");
+    checkOrder(db, i.orderId, "SO", i.contactId, i.lines);
     const p = planner(db, i.docDate);
     let revenue = 0;
     let vat = 0;
@@ -434,7 +583,8 @@ export function postSale(
     return commit(db, {
       ...i,
       kind: "SALE",
-      counterparty: i.customer,
+      counterparty: i.customer || customer?.name || "",
+      dueDate: i.paid ? undefined : (i.dueDate ?? (customer ? addDaysIso(i.docDate, customer.terms_days) : undefined)),
       lines: [
         { account: i.paid ? ACC.CASH : ACC.AR, debit: revenue + vat, credit: 0 },
         { account: ACC.REVENUE, debit: 0, credit: revenue },
@@ -506,7 +656,7 @@ export function vatPosition(db: DB) {
   return { output, input, net: output - input };
 }
 
-export function postCash(db: DB, i: Common & { type: CashType; amount: number; counterparty: string }) {
+export function postCash(db: DB, i: Common & { type: CashType; amount: number; counterparty: string; invoiceIds?: number[] }) {
   return posting(db, i.idempotencyKey, () => {
     checkPostingDate(db, i.docDate);
     if (i.type === "PAY_VAT") {
@@ -536,15 +686,25 @@ export function postCash(db: DB, i: Common & { type: CashType; amount: number; c
       throw new LedgerError("That's more than customers owe.");
     }
     const [dr, cr] = pair[i.type];
-    return commit(db, {
+    const side = i.type === "RECEIVE_CUSTOMER" ? "AR" : i.type === "PAY_SUPPLIER" ? "AP" : null;
+    const contact = side ? contactFor(db, i.contactId, side === "AR" ? "CUSTOMER" : "SUPPLIER") : undefined;
+    if (side && i.invoiceIds?.length) {
+      const open = openInvoices(db, { side, contactId: i.contactId });
+      const sum = i.invoiceIds.reduce((t, id) => t + (open.find((o) => o.id === id)?.open ?? 0), 0);
+      if (i.amount > sum) throw new LedgerError("The amount is more than the open balance of the selected invoices.");
+    }
+    const j = commit(db, {
       ...i,
       kind: "PAYMENT",
+      counterparty: i.counterparty || contact?.name || "",
       lines: [
         { account: dr, debit: i.amount, credit: 0 },
         { account: cr, debit: 0, credit: i.amount },
       ],
       moves: [],
     });
+    if (side) allocate(db, j.id, side, i.contactId, i.amount, i.invoiceIds);
+    return j;
   });
 }
 
@@ -594,7 +754,7 @@ export function settleForeignInvoice(db: DB, i: Common & { receiptId: number; fx
     ];
     if (diff > 0) lines.push({ account: ACC.FX_LOSS, debit: diff, credit: 0 });
     if (diff < 0) lines.push({ account: ACC.FX_GAIN, debit: 0, credit: -diff });
-    return commit(db, {
+    const j = commit(db, {
       ...i,
       kind: "PAYMENT",
       counterparty: inv.counterparty,
@@ -604,9 +764,12 @@ export function settleForeignInvoice(db: DB, i: Common & { receiptId: number; fx
       fxRate: i.fxRate,
       foreignAmount: inv.foreign_amount,
       settlesId: inv.id,
+      contactId: i.contactId ?? get<{ c: number | null }>(db, "SELECT contact_id c FROM journals WHERE id = ?", inv.id)?.c ?? undefined,
       lines,
       moves: [],
     });
+    allocate(db, j.id, "AP", undefined, inv.eur_amount, [inv.id]);
+    return j;
   });
 }
 
@@ -617,7 +780,7 @@ export function settleForeignInvoice(db: DB, i: Common & { receiptId: number; fx
  */
 export function reverseJournal(
   db: DB,
-  i: { journalId: number; docDate: string; reason: string; idempotencyKey?: string; postedAt?: string },
+  i: { journalId: number; docDate: string; reason: string; idempotencyKey?: string; postedAt?: string; actorId?: number; approvedBy?: number },
 ) {
   return posting(db, i.idempotencyKey, () => {
     checkPostingDate(db, i.docDate);
@@ -632,6 +795,12 @@ export function reverseJournal(
       orig.id,
     );
     if (settlement) throw new LedgerError(`This invoice was paid by #${settlement.id}. Reverse that payment first.`);
+    const paidBy = get<{ p: number }>(
+      db,
+      "SELECT a.payment_id p FROM allocations a WHERE a.invoice_id = ? AND NOT EXISTS (SELECT 1 FROM journals r WHERE r.reverses_id = a.payment_id) LIMIT 1",
+      orig.id,
+    );
+    if (paidBy) throw new LedgerError(`Payment #${paidBy.p} has been applied to this invoice. Reverse that payment first.`);
     const already = get<{ id: number }>(db, "SELECT id FROM journals WHERE reverses_id = ?", orig.id);
     if (already) throw new LedgerError(`Journal #${orig.id} was already reversed by #${already.id}.`);
     if (i.docDate < orig.doc_date) throw new LedgerError("A reversal cannot be dated before the original entry.");
@@ -652,6 +821,9 @@ export function reverseJournal(
       kind: "REVERSAL",
       docDate: i.docDate,
       postedAt: i.postedAt,
+      actorId: i.actorId,
+      approvedBy: i.approvedBy,
+      contactId: orig.contact_id ?? undefined,
       idempotencyKey: i.idempotencyKey,
       reversesId: orig.id,
       memo: `Reversal of #${orig.id}: ${i.reason.trim()}`,
@@ -795,4 +967,91 @@ export function setBudget(db: DB, entries: { period: string; account: string; am
     if (changed) audit(db, actor, "BUDGET_UPDATED", `${changed} budget figure(s) changed`);
     return changed;
   });
+}
+
+// ───────────────────────── contacts & orders (master/operational data) ─────────────────────────
+
+export function createContact(
+  db: DB,
+  c: { kind: ContactKind; name: string; email?: string; vatId?: string; termsDays?: number; currency?: string },
+  actor = "system",
+) {
+  const name = c.name.trim();
+  if (!name) throw new LedgerError("Give the contact a name.");
+  if (c.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(c.email.trim())) throw new LedgerError("That email address doesn't look right.");
+  const terms = c.termsDays ?? 14;
+  if (!Number.isInteger(terms) || terms < 0 || terms > 180) throw new LedgerError("Payment terms must be 0–180 days.");
+  const cur = c.currency ?? "EUR";
+  assertCurrency(cur);
+  if (get(db, "SELECT id FROM contacts WHERE kind = ? AND name = ?", c.kind, name)) throw new LedgerError(`A ${c.kind.toLowerCase()} called ${name} already exists.`);
+  const r = run(
+    db,
+    "INSERT INTO contacts (kind, name, email, vat_id, terms_days, currency, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    c.kind, name, c.email?.trim() ?? "", c.vatId?.trim() ?? "", terms, cur, new Date().toISOString(),
+  );
+  audit(db, actor, "CONTACT_CREATED", `${c.kind.toLowerCase()} ${name}`);
+  return Number(r.lastInsertRowid);
+}
+
+export function createOrder(
+  db: DB,
+  o: {
+    kind: "PO" | "SO";
+    contactId: number;
+    warehouseId: number;
+    orderDate: string;
+    expectedDate?: string;
+    currency?: string;
+    fxRate?: string;
+    notes?: string;
+    lines: { itemId: number; qty: number; unitAmount: number; vatRate?: number }[];
+    actorId?: number;
+  },
+  actor = "system",
+) {
+  return tx(db, () => {
+    assertDate(o.orderDate);
+    if (o.expectedDate) assertDate(o.expectedDate);
+    contactFor(db, o.contactId, o.kind === "PO" ? "SUPPLIER" : "CUSTOMER");
+    if (!get(db, "SELECT id FROM warehouses WHERE id = ?", o.warehouseId)) throw new LedgerError("Unknown warehouse.");
+    if (!o.lines.length) throw new LedgerError("Add at least one line.");
+    const currency = o.currency && o.currency !== "EUR" ? o.currency : "EUR";
+    assertCurrency(currency);
+    if (o.kind === "SO" && currency !== "EUR") throw new LedgerError("Sales orders are in EUR.");
+    if (currency !== "EUR") {
+      if (!o.fxRate) throw new LedgerError(`Enter the expected ${currency} → EUR rate.`);
+      parseRate(o.fxRate);
+    }
+    for (const l of o.lines) {
+      assertQty(l.qty);
+      assertCents(l.unitAmount, "Unit amount");
+      assertVat(currency !== "EUR" ? 0 : (l.vatRate ?? 0));
+      if (!get(db, "SELECT id FROM items WHERE id = ?", l.itemId)) throw new LedgerError(`Unknown item #${l.itemId}.`);
+    }
+    const seq = (get<{ n: number }>(db, "SELECT COUNT(*) n FROM orders WHERE kind = ?", o.kind)!.n + 1).toString().padStart(4, "0");
+    const number = `${o.kind}-${o.orderDate.slice(0, 4)}-${seq}`;
+    const r = run(
+      db,
+      `INSERT INTO orders (kind, number, contact_id, warehouse_id, order_date, expected_date, currency, fx_rate, notes, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      o.kind, number, o.contactId, o.warehouseId, o.orderDate, o.expectedDate ?? null, currency, currency !== "EUR" ? o.fxRate! : null,
+      o.notes?.trim() ?? "", o.actorId ?? null, new Date().toISOString(),
+    );
+    const id = Number(r.lastInsertRowid);
+    for (const l of o.lines) {
+      run(db, "INSERT INTO order_lines (order_id, item_id, qty, unit_amount, vat_rate) VALUES (?, ?, ?, ?, ?)", id, l.itemId, l.qty, l.unitAmount, currency !== "EUR" ? 0 : (l.vatRate ?? 0));
+    }
+    audit(db, actor, "ORDER_CREATED", `${number}`);
+    return { id, number };
+  });
+}
+
+export function cancelOrder(db: DB, orderId: number, actor: string) {
+  const o = get<{ number: string; cancelled_at: string | null }>(db, "SELECT number, cancelled_at FROM orders WHERE id = ?", orderId);
+  if (!o) throw new LedgerError("Unknown order.");
+  if (o.cancelled_at) throw new LedgerError(`${o.number} is already cancelled.`);
+  const rem = [...orderRemaining(db, orderId).values()].reduce((a, b) => a + b, 0);
+  if (rem === 0) throw new LedgerError(`${o.number} is already fully delivered.`);
+  run(db, "UPDATE orders SET cancelled_at = ? WHERE id = ?", new Date().toISOString(), orderId);
+  audit(db, actor, "ORDER_CANCELLED", `${o.number} (remaining quantities closed)`);
 }

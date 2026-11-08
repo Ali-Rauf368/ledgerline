@@ -6,7 +6,8 @@ import type { DB } from "./db.ts";
 import { all, APPEND_ONLY_TABLES } from "./db.ts";
 import { ACC } from "./accounts.ts";
 import type { JournalRow, LineRow, MoveRow } from "./ledger.ts";
-import { computeJournalHash, GENESIS_HASH, monthEnd, periodSnapshot, sha256 } from "./ledger.ts";
+import { computeJournalHash, GENESIS_HASH, monthEnd, openInvoices, periodSnapshot, sha256 } from "./ledger.ts";
+import { unappliedPayments } from "./reports.ts";
 
 export type Check = { id: string; label: string; description: string; ok: boolean; detail: string };
 
@@ -149,7 +150,26 @@ export function verifyLedger(db: DB) {
     });
   }
 
-  // 8. Reversals well-formed
+  // 8. Receivables & payables reconcile to open items
+  {
+    const bad: string[] = [];
+    for (const side of ["AR", "AP"] as const) {
+      const acc = side === "AR" ? ACC.AR : ACC.AP;
+      const gl = lines.filter((l) => l.account_code === acc).reduce((t, l) => t + (side === "AR" ? l.debit - l.credit : l.credit - l.debit), 0);
+      const open = openInvoices(db, { side }).reduce((t, i) => t + i.open, 0);
+      const unapplied = unappliedPayments(db, side).reduce((t, p) => t + p.amount, 0);
+      if (gl !== open - unapplied) bad.push(`${side}: GL ${(gl / 100).toFixed(2)} vs open items ${((open - unapplied) / 100).toFixed(2)}`);
+    }
+    checks.push({
+      id: "openitems",
+      label: "Receivables & payables match open items",
+      description: "The AR and AP control accounts equal the open invoices minus unapplied payments, customer by customer and supplier by supplier.",
+      ok: !bad.length,
+      detail: bad.length ? bad.join("; ") : "AR and AP reconcile",
+    });
+  }
+
+  // 9. Reversals well-formed
   {
     const ids = new Map(journals.map((j) => [j.id, j]));
     const bad = journals.filter((j) => {

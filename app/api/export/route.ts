@@ -1,4 +1,5 @@
 import { getDb } from "@/lib/db";
+import { currentUser } from "@/lib/session";
 import { today } from "@/lib/ledger";
 import { balanceSheet, incomeStatement, inventoryValuation, journalsList, trialBalance } from "@/lib/reports";
 
@@ -13,7 +14,8 @@ const cell = (v: string | number) => {
 };
 const isDate = (s: string | null) => !!s && /^\d{4}-\d{2}-\d{2}$/.test(s);
 
-export function GET(req: Request) {
+export async function GET(req: Request) {
+  if (!(await currentUser())) return new Response("Sign in required", { status: 401 });
   const url = new URL(req.url);
   const report = url.searchParams.get("report") ?? "tb";
   const asOf = isDate(url.searchParams.get("asOf")) ? url.searchParams.get("asOf")! : today();

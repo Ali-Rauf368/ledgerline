@@ -117,13 +117,13 @@ export function ClosePeriodButton({ period }: { period: string }) {
   if (!confirming) {
     return (
       <button className="btn-primary" onClick={() => setConfirming(true)}>
-        <Lock className="size-4" /> Close {fmtMonth(period)}
+        <Lock className="size-4" /> Request close of {fmtMonth(period)}
       </button>
     );
   }
   return (
     <div className="w-full space-y-2 sm:w-auto">
-      <p className="text-xs text-muted sm:max-w-xs">Closing is permanent. No entry can be dated in {fmtMonth(period)} afterwards, and a hashed snapshot is sealed.</p>
+      <p className="text-xs text-muted sm:max-w-xs">Closing is permanent: no entry can be dated in {fmtMonth(period)} afterwards and a hashed snapshot is sealed. A second person must approve it.</p>
       <ErrorNote message={error} />
       <div className="flex gap-2">
         <button className="btn-ghost" onClick={() => setConfirming(false)}>Cancel</button>
@@ -135,12 +135,12 @@ export function ClosePeriodButton({ period }: { period: string }) {
               const r = await closePeriodAction(period);
               if (r.ok) {
                 setConfirming(false);
-                router.refresh();
+                router.push("/approvals");
               } else setError(r.error);
             })
           }
         >
-          {pending ? "Sealing…" : "Confirm close"}
+          {pending ? "Sending…" : "Send for approval"}
         </button>
       </div>
     </div>

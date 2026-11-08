@@ -8,10 +8,13 @@ import { getDb } from "@/lib/db";
 import { today } from "@/lib/ledger";
 import { fmtMonth, fmtPct, fmtTimestamp, fmtMoney } from "@/lib/money";
 import { budgetVsActual } from "@/lib/reports";
+import { pageUser } from "@/lib/session";
+import { can } from "@/lib/auth";
 
 export default async function BudgetsPage({ searchParams }: { searchParams: Promise<{ year?: string }> }) {
   const sp = await searchParams;
   const year = sp.year && /^\d{4}$/.test(sp.year) ? sp.year : today().slice(0, 4);
+  const user = await pageUser();
   const b = budgetVsActual(getDb(), year);
   const label = (c: string) => (c === ACC.REVENUE ? "Revenue" : c === ACC.COGS ? "Cost of goods sold" : "Operating expenses");
   const revenue = b.rows.find((r) => r.code === ACC.REVENUE)!;
@@ -79,10 +82,10 @@ export default async function BudgetsPage({ searchParams }: { searchParams: Prom
         <p className="px-5 py-3 text-[11px] text-muted">* month to date</p>
       </Card>
 
-      <Card className="mt-6">
+      {can(user, "budget:edit") && <Card className="mt-6">
         <CardHeader title="Edit budget" subtitle="Whole euros per month." />
         <BudgetEditor rows={b.rows.map((r) => ({ code: r.code, label: label(r.code), cells: r.cells.map((c) => ({ month: c.month, budget: c.budget })) }))} />
-      </Card>
+      </Card>}
 
       {b.history.length > 0 && (
         <Card className="mt-6">

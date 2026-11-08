@@ -61,9 +61,14 @@ function estEur(minor: number, currency: Currency, rate: string) {
 const fmtForeign = (minor: number, c: Currency) =>
   new Intl.NumberFormat("en-IE", { style: "currency", currency: c }).format(minor / 10 ** CURRENCY_DECIMALS[c]);
 
+export type ContactOption = { id: number; name: string; kind: "CUSTOMER" | "SUPPLIER"; currency: string };
+
 export function TransactionForm({
-  items, warehouses, today, lockedThrough, payables, receivables, vatNet, openInvoices, draft,
+  items, warehouses, today, lockedThrough, payables, receivables, vatNet, openInvoices, draft, contacts, allowed, threshold,
 }: {
+  contacts: ContactOption[];
+  allowed: Kind[];
+  threshold: number;
   items: ItemOption[];
   warehouses: Wh[];
   today: string;
@@ -79,7 +84,10 @@ export function TransactionForm({
   const [error, setError] = useState<string | null>(null);
   const key = useRef(crypto.randomUUID());
 
-  const [kind, setKind] = useState<Kind>(draft?.kind ?? "RECEIPT");
+  const [kind, setKind] = useState<Kind>(draft?.kind && allowed.includes(draft.kind) ? draft.kind : (allowed[0] ?? "RECEIPT"));
+  const [contactId, setContactId] = useState(draft?.contactId ? String(draft.contactId) : "");
+  const [queued, setQueued] = useState<number | null>(null);
+  const orderId = draft?.orderId;
   const [docDate, setDocDate] = useState(today);
   const [warehouseId, setWarehouseId] = useState(String(draft?.warehouseId ?? warehouses[0]?.id ?? ""));
   const [toWarehouseId, setToWarehouseId] = useState(String(draft?.toWarehouseId ?? warehouses[1]?.id ?? warehouses[0]?.id ?? ""));
@@ -175,8 +183,20 @@ export function TransactionForm({
 
   const setRow = (k: number, patch: Partial<Row>) => setRows((rs) => rs.map((r) => (r.key === k ? { ...r, ...patch } : r)));
 
+  const contactKind = kind === "SALE" || (kind === "PAYMENT" && cashType === "RECEIVE_CUSTOMER") ? "CUSTOMER" : kind === "RECEIPT" || (kind === "PAYMENT" && cashType === "PAY_SUPPLIER") ? "SUPPLIER" : null;
+  const contactChoices = contacts.filter((c) => c.kind === contactKind);
+  function chooseContact(id: string) {
+    setContactId(id);
+    const c = contacts.find((x) => String(x.id) === id);
+    if (c) {
+      setCounterparty(c.name);
+      if (kind === "RECEIPT") setCurrency(c.currency as Currency);
+    }
+  }
+
   function build(): TxPayload | string {
-    const base = { docDate, reference, memo, idempotencyKey: key.current };
+    const validContact = contactKind && contacts.some((c) => String(c.id) === contactId && c.kind === contactKind);
+    const base = { docDate, reference, memo, idempotencyKey: key.current, contactId: validContact ? Number(contactId) : undefined, orderId: kind === "RECEIPT" || kind === "SALE" ? orderId : undefined };
     if (kind === "PAYMENT") {
       if (cashType === "SETTLE_FX") {
         if (!invoice) return "Choose the foreign-currency invoice to pay.";
@@ -225,7 +245,8 @@ export function TransactionForm({
     start(async () => {
       const r = await postTransaction(payload);
       key.current = crypto.randomUUID();
-      if (r.ok) router.push(`/transactions/${r.id}`);
+      if (r.ok && r.approval) setQueued(r.approval);
+      else if (r.ok) router.push(`/transactions/${r.id}`);
       else setError(r.error);
     });
   }
@@ -235,6 +256,20 @@ export function TransactionForm({
   const hasAmount = kind === "RECEIPT" || kind === "SALE" || kind === "ADJUSTMENT";
   const hasVat = kind === "RECEIPT" || kind === "SALE";
   const debits = preview.lines.reduce((s, l) => s + l.debit, 0);
+  const face = preview.lines.reduce((m, l) => Math.max(m, l.debit, l.credit), 0);
+
+  if (queued) {
+    return (
+      <div className="mx-auto max-w-lg rounded-2xl border border-warn/40 bg-warn-soft p-8 text-center">
+        <p className="text-lg font-semibold text-ink">Sent for approval</p>
+        <p className="mt-2 text-sm text-muted">This entry is {fmtMoney(threshold)} or more, so a second person has to approve it before it is posted (request #{queued}).</p>
+        <div className="mt-5 flex justify-center gap-2">
+          <a href="/approvals" className="btn-primary">View approvals</a>
+          <button className="btn-ghost" onClick={() => { setQueued(null); setRows([blankRow()]); }}>New transaction</button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <form onSubmit={submit} className="grid gap-6 xl:grid-cols-[1fr_360px]">
@@ -247,8 +282,11 @@ export function TransactionForm({
             </p>
           </div>
         )}
+        {orderId && (
+          <p className="rounded-xl bg-surface-2 px-4 py-2.5 text-sm text-muted">Posting against order <span className="font-mono font-medium text-ink">{reference}</span>. Quantities can&apos;t exceed what is still outstanding.</p>
+        )}
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
-          {TABS.map(({ kind: k, label, icon: Icon }) => (
+          {TABS.filter((t) => allowed.includes(t.kind)).map(({ kind: k, label, icon: Icon }) => (
             <button
               type="button"
               key={k}
@@ -340,6 +378,16 @@ export function TransactionForm({
                   </div>
                 )}
               </>
+            )}
+            {contactKind && (
+              <div>
+                <label className="label" htmlFor="contact">{contactKind === "CUSTOMER" ? "Customer account" : "Supplier account"}</label>
+                <select id="contact" className="field" value={contactId} onChange={(e) => chooseContact(e.target.value)}>
+                  <option value="">— none (one-off) —</option>
+                  {contactChoices.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+                <p className="mt-1 text-[11px] text-muted">{kind === "PAYMENT" ? "Applied to the oldest open invoices first." : "Sets the due date from the payment terms."}</p>
+              </div>
             )}
             {(kind === "RECEIPT" || kind === "SALE" || (kind === "PAYMENT" && cashType !== "SETTLE_FX")) && (
               <div>
@@ -476,7 +524,8 @@ export function TransactionForm({
           </div>
           <div className="space-y-3 border-t border-line px-5 py-4">
             <ErrorNote message={error} />
-            <button className="btn-primary w-full py-2.5" disabled={pending}>{pending ? "Posting…" : tab.cta}</button>
+            {face >= threshold && <p className="rounded-lg bg-warn-soft px-3 py-2 text-xs text-warn">Over {fmtMoney(threshold)}: this will be sent to a colleague for approval before posting.</p>}
+            <button className="btn-primary w-full py-2.5" disabled={pending}>{pending ? "Posting…" : face >= threshold ? "Submit for approval" : tab.cta}</button>
             <p className="text-center text-[11px] text-muted">
               Posted entries are permanent and hash-chained.{lockedThrough && ` Books are locked through ${fmtMonth(lockedThrough)}.`}
             </p>

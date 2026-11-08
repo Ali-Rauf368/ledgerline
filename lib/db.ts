@@ -15,9 +15,12 @@ export const get = <T>(db: DB, sql: string, ...p: Param[]) => {
 export const run = (db: DB, sql: string, ...p: Param[]) => db.prepare(sql).run(...p);
 
 /** Tables that may only ever grow. Enforced by the database itself, not just the app. */
-export const APPEND_ONLY_TABLES = ["journals", "journal_lines", "stock_moves", "period_closes", "audit_events", "budget_entries", "commentaries"];
+export const APPEND_ONLY_TABLES = [
+  "journals", "journal_lines", "stock_moves", "period_closes", "audit_events", "budget_entries", "commentaries",
+  "allocations", "bank_statements", "bank_lines", "bank_match_events",
+];
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS accounts (
@@ -39,6 +42,71 @@ CREATE TABLE IF NOT EXISTS items (
   vat_rate INTEGER NOT NULL DEFAULT 19 CHECK (vat_rate IN (0, 7, 19)),
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  name TEXT NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('ADMIN','ACCOUNTANT','WAREHOUSE','VIEWER')),
+  password_hash TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  last_login_at TEXT
+);
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  user_agent TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS contacts (
+  id INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('CUSTOMER','SUPPLIER')),
+  name TEXT NOT NULL,
+  email TEXT NOT NULL DEFAULT '',
+  vat_id TEXT NOT NULL DEFAULT '',
+  terms_days INTEGER NOT NULL DEFAULT 14 CHECK (terms_days BETWEEN 0 AND 180),
+  currency TEXT NOT NULL DEFAULT 'EUR',
+  created_at TEXT NOT NULL,
+  UNIQUE (kind, name)
+);
+CREATE TABLE IF NOT EXISTS orders (
+  id INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('PO','SO')),
+  number TEXT NOT NULL UNIQUE,
+  contact_id INTEGER NOT NULL REFERENCES contacts(id),
+  warehouse_id INTEGER NOT NULL REFERENCES warehouses(id),
+  order_date TEXT NOT NULL,
+  expected_date TEXT,
+  currency TEXT NOT NULL DEFAULT 'EUR',
+  fx_rate TEXT,
+  notes TEXT NOT NULL DEFAULT '',
+  cancelled_at TEXT,
+  created_by INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS order_lines (
+  id INTEGER PRIMARY KEY,
+  order_id INTEGER NOT NULL REFERENCES orders(id),
+  item_id INTEGER NOT NULL REFERENCES items(id),
+  qty INTEGER NOT NULL CHECK (qty > 0),
+  unit_amount INTEGER NOT NULL CHECK (unit_amount >= 0),
+  vat_rate INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS approvals (
+  id INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN ('POSTING','PERIOD_CLOSE')),
+  summary TEXT NOT NULL,
+  amount INTEGER NOT NULL DEFAULT 0,
+  payload TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING','APPROVED','REJECTED','FAILED')),
+  requested_by INTEGER NOT NULL REFERENCES users(id),
+  requested_at TEXT NOT NULL,
+  decided_by INTEGER REFERENCES users(id),
+  decided_at TEXT,
+  note TEXT NOT NULL DEFAULT '',
+  journal_id INTEGER REFERENCES journals(id)
+);
 CREATE TABLE IF NOT EXISTS journals (
   id INTEGER PRIMARY KEY,
   kind TEXT NOT NULL CHECK (kind IN ('RECEIPT','SALE','TRANSFER','ADJUSTMENT','PAYMENT','REVERSAL','CLOSING')),
@@ -53,6 +121,11 @@ CREATE TABLE IF NOT EXISTS journals (
   fx_rate TEXT,
   foreign_amount INTEGER,
   settles_id INTEGER REFERENCES journals(id),
+  created_by INTEGER REFERENCES users(id),
+  approved_by INTEGER REFERENCES users(id),
+  contact_id INTEGER REFERENCES contacts(id),
+  due_date TEXT,
+  order_id INTEGER REFERENCES orders(id),
   prev_hash TEXT NOT NULL,
   hash TEXT NOT NULL UNIQUE,
   CHECK ((currency IS NULL) = (fx_rate IS NULL) AND (currency IS NULL) = (foreign_amount IS NULL))
@@ -89,6 +162,45 @@ CREATE TABLE IF NOT EXISTS period_closes (
   snapshot TEXT NOT NULL,
   snapshot_hash TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS ix_journals_contact ON journals(contact_id);
+CREATE INDEX IF NOT EXISTS ix_journals_order ON journals(order_id);
+CREATE TABLE IF NOT EXISTS allocations (
+  id INTEGER PRIMARY KEY,
+  payment_id INTEGER NOT NULL REFERENCES journals(id),
+  invoice_id INTEGER NOT NULL REFERENCES journals(id),
+  amount INTEGER NOT NULL CHECK (amount > 0)
+);
+CREATE INDEX IF NOT EXISTS ix_alloc_invoice ON allocations(invoice_id);
+CREATE INDEX IF NOT EXISTS ix_alloc_payment ON allocations(payment_id);
+CREATE TABLE IF NOT EXISTS bank_statements (
+  id INTEGER PRIMARY KEY,
+  filename TEXT NOT NULL,
+  content_hash TEXT NOT NULL UNIQUE,
+  period_from TEXT NOT NULL,
+  period_to TEXT NOT NULL,
+  closing_balance INTEGER,
+  imported_by INTEGER REFERENCES users(id),
+  imported_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS bank_lines (
+  id INTEGER PRIMARY KEY,
+  statement_id INTEGER NOT NULL REFERENCES bank_statements(id),
+  date TEXT NOT NULL,
+  description TEXT NOT NULL,
+  reference TEXT NOT NULL DEFAULT '',
+  amount INTEGER NOT NULL CHECK (amount <> 0)
+);
+CREATE TABLE IF NOT EXISTS bank_match_events (
+  id INTEGER PRIMARY KEY,
+  bank_line_id INTEGER NOT NULL REFERENCES bank_lines(id),
+  journal_id INTEGER REFERENCES journals(id),
+  action TEXT NOT NULL CHECK (action IN ('MATCH','UNMATCH')),
+  method TEXT NOT NULL CHECK (method IN ('AUTO','MANUAL','CREATED','AI')),
+  score REAL,
+  by_user INTEGER REFERENCES users(id),
+  at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_bme_line ON bank_match_events(bank_line_id, id);
 CREATE TABLE IF NOT EXISTS budget_entries (
   id INTEGER PRIMARY KEY,
   period TEXT NOT NULL,

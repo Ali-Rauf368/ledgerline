@@ -10,6 +10,8 @@ import { commentaries } from "@/lib/assistant";
 import { getDb } from "@/lib/db";
 import { lockedThrough, today } from "@/lib/ledger";
 import { fmtDate, fmtMoney, fmtMonth, fmtTimestamp } from "@/lib/money";
+import { pageUser } from "@/lib/session";
+import { can } from "@/lib/auth";
 
 const SEV = {
   high: { tone: "neg" as const, icon: ShieldAlert, label: "High" },
@@ -28,6 +30,7 @@ const TYPE_LABEL: Record<string, string> = {
 
 export default async function InsightsPage({ searchParams }: { searchParams: Promise<{ all?: string }> }) {
   const sp = await searchParams;
+  const user = await pageUser();
   const db = getDb();
   const t = today();
   const anomalies = detectAnomalies(db);
@@ -95,7 +98,7 @@ export default async function InsightsPage({ searchParams }: { searchParams: Pro
           <CardHeader
             title={<span className="flex items-center gap-2"><Sparkles className="size-4 text-accent" /> Month-end commentary</span>}
             subtitle="Written by Claude from ledger facts. Each version is stored append-only with a hash of its source data."
-            action={<GenerateCommentaryButton period={lock && lock >= lastMonth ? lastMonth : lastMonth} label={`Write for ${fmtMonth(lastMonth)}`} />}
+            action={can(user, "ai:commentary") && <GenerateCommentaryButton period={lock && lock >= lastMonth ? lastMonth : lastMonth} label={`Write for ${fmtMonth(lastMonth)}`} />}
           />
           {notes.length === 0 ? (
             <Empty title="No commentary yet" body={`Generate a briefing for ${fmtMonth(lastMonth)}.`} />

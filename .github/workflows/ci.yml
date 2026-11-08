@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: Seed demo database and verify integrity
+        run: npm run seed
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t ledgerline:ci .
+      - name: Smoke test the container
+        run: |
+          docker run -d --name ll -p 3700:3700 ledgerline:ci
+          for i in $(seq 1 60); do curl -fs http://localhost:3700/api/health && break; sleep 2; done
+          curl -fs http://localhost:3700/api/health | grep '"ok":true'
+          docker logs ll | tail -5

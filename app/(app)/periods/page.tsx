@@ -9,8 +9,11 @@ import { verifyLedger } from "@/lib/integrity";
 import { lockedThrough } from "@/lib/ledger";
 import { fmtDate, fmtMonth, fmtTimestamp } from "@/lib/money";
 import { periodsOverview } from "@/lib/reports";
+import { pageUser } from "@/lib/session";
+import { can } from "@/lib/auth";
 
-export default function PeriodsPage() {
+export default async function PeriodsPage() {
+  const user = await pageUser();
   const db = getDb();
   const periods = periodsOverview(db);
   const lock = lockedThrough(db);
@@ -57,8 +60,8 @@ export default function PeriodsPage() {
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
-                  {p.status !== "current" && p.journals > 0 && <GenerateCommentaryButton period={p.period} label={notes.has(p.period) ? "Rewrite commentary" : "AI commentary"} />}
-                  {p.status === "closable" && <ClosePeriodButton period={p.period} />}
+                  {p.status !== "current" && p.journals > 0 && can(user, "ai:commentary") && <GenerateCommentaryButton period={p.period} label={notes.has(p.period) ? "Rewrite commentary" : "AI commentary"} />}
+                  {p.status === "closable" && can(user, "period:close") && <ClosePeriodButton period={p.period} />}
                 </div>
                 {p.status === "current" && <p className="text-xs text-muted">Can be closed after {fmtDate(p.end)}</p>}
               </div>

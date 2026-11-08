@@ -1,0 +1,19 @@
+services:
+  app:
+    build: .
+    image: ledgerline:latest
+    ports:
+      - "3700:3700"
+    environment:
+      # Optional: enables the full Claude-powered Copilot and AI commentary.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # 1 = seed demo data (5 demo users, password demo1234) on first start; 0 = start empty.
+      LEDGERLINE_DEMO: ${LEDGERLINE_DEMO:-1}
+      # Set to 1 only if you serve over plain HTTP on a non-localhost address (cookies are Secure by default).
+      LEDGERLINE_INSECURE_COOKIES: ${LEDGERLINE_INSECURE_COOKIES:-0}
+    volumes:
+      - ledger-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  ledger-data:

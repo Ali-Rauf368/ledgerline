@@ -5,8 +5,11 @@ import { getDb } from "@/lib/db";
 import { fmtMoney, fmtQty } from "@/lib/money";
 import { itemsOverview, reorderInsights, warehouses } from "@/lib/reports";
 import { AskCopilotButton } from "@/components/AskCopilotButton";
+import { pageUser } from "@/lib/session";
+import { can } from "@/lib/auth";
 
-export default function InventoryPage() {
+export default async function InventoryPage() {
+  const user = await pageUser();
   const db = getDb();
   const items = itemsOverview(db);
   const whs = warehouses(db);
@@ -111,12 +114,12 @@ export default function InventoryPage() {
         </Card>
 
         <div className="flex flex-col gap-6">
-          <Card>
+          {can(user, "post:RECEIPT") && <Card>
             <CardHeader title="New item" subtitle="Items are master data; their stock history is immutable." />
             <div className="p-5">
               <NewItemForm />
             </div>
-          </Card>
+          </Card>}
           <Card className="p-5">
             <h2 className="text-sm font-semibold text-ink">Warehouses</h2>
             <ul className="mt-3 space-y-3">

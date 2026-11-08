@@ -6,7 +6,33 @@ edited or deleted after posting.
 
 ![stack](https://img.shields.io/badge/Next.js-16-black) ![stack](https://img.shields.io/badge/SQLite-node%3Asqlite-blue) ![tests](https://img.shields.io/badge/tests-node%3Atest-green)
 
-## Quick start
+## Run with Docker
+
+```bash
+docker compose up -d --build        # http://localhost:3700
+```
+
+On first start the container seeds a demo company (set `LEDGERLINE_DEMO=0` to start empty and
+create an admin with `docker compose exec app node scripts/create-admin.ts you@x.com "Your Name" 'password'`).
+Data lives in the `ledger-data` volume. Pass `ANTHROPIC_API_KEY` to enable the full AI features.
+`GET /api/health` is the health check. Any container host works (Fly.io, Render, Railway, a VPS):
+mount a persistent volume at `/app/data` and serve over HTTPS.
+
+## Demo accounts
+
+All use the password `demo1234`. The sign-in page has one-click buttons.
+
+| Account | Role | Can |
+| --- | --- | --- |
+| admin@ledgerline.demo | Administrator | everything, including users & roles |
+| anna@ledgerline.demo / tom@ledgerline.demo | Accountant | post, reverse, approve (not their own requests), bank, budgets |
+| wes@ledgerline.demo | Warehouse | receive goods, transfers, adjustments, purchase orders |
+| vic@ledgerline.demo | Viewer | read-only: reports, insights, Copilot |
+
+Try: sign in as **Tom** and approve Anna's pending sale and period close; as **Anna**, import the demo
+bank statement on *Bank reconciliation* and book the two unmatched lines.
+
+## Quick start (without Docker)
 
 ```bash
 npm install
@@ -39,8 +65,25 @@ revenue, cash, integrity, reversals) from the same data.
 | **Insights** | Anomalies, demand and cash forecasts, AI month-end commentary |
 | **Budgets** | Monthly budgets with versioned edits and variance analysis |
 | **Periods** | Close months in order; each close seals a SHA-256 snapshot |
-| **Integrity** | Nine independent checks that recompute everything from raw rows |
+| **Integrity** | Ten independent checks that recompute everything from raw rows |
 | **Audit log** | Period closes, reversals, item creation and rejected posting attempts |
+
+### Users, control and operations
+
+- **Sign-in and roles:** scrypt password hashes, HTTP-only session cookies (only a SHA-256 of the token is
+  stored), login throttling and four roles with per-action permissions enforced on the server.
+  Every journal records **who posted it** inside its hash.
+- **Four-eyes approvals:** postings of €5,000 or more and every period close are queued until a *different*
+  user with approval rights signs off. The journal stores the requester and the approver.
+- **Customers & suppliers:** payment terms set invoice due dates. Payments are applied to the oldest
+  invoices first (or to chosen ones), with **AR/AP ageing** (current, 1–30, 31–60, 61–90, 90+ days). A new
+  integrity check proves AR and AP equal the open items.
+- **Purchase & sales orders:** commitments that are received or delivered in parts. Over-delivery is
+  refused, reversals reopen quantities, and cancelling closes the rest.
+- **Bank reconciliation:** import a CSV (German *Buchungstag/Betrag/Saldo* or international). Lines are
+  auto-matched by amount, date and payee; unknown lines (fees, unannounced payments) get suggestions and
+  are booked in one click; a reconciliation proof shows the difference, which must be €0.00. Imports are
+  content-hashed (no double import) and matches are an append-only event log.
 
 ### Advanced accounting
 
@@ -109,7 +152,11 @@ lib/ledger.ts      posting engine: validation, costing, hash chain, reversals, p
 lib/integrity.ts   independent verifier (8 checks)
 lib/reports.ts     read models: TB, P&L, balance sheet, valuation, stock card, dashboard
 lib/db.ts          schema, append-only triggers, connection
-lib/actions.ts     Next.js server actions (thin layer over the engine)
+lib/actions.ts     Next.js server actions: permission checks, approvals, then the engine
+lib/auth.ts        users, password hashing, sessions, roles & permissions
+lib/approvals.ts   four-eyes approval queue
+lib/bank.ts        statement import, matching, reconciliation
+proxy.ts           redirects signed-out requests to /login
 lib/assistant.ts   Ledger Copilot: Claude tool loop, drafts, month-end commentary, offline fallback
 lib/analytics.ts   anomaly detection, demand and cash forecasting
 lib/draft.ts       AI transaction drafts (pre-fill only)
@@ -122,8 +169,9 @@ tests/             node:test suite for the engine
 
 ## Notes
 
-- This is a demo with no authentication. Actions are attributed to "Demo user" in the audit trail.
+- Demo credentials are public; for a real deployment set `LEDGERLINE_DEMO=0`, create your own admin,
+  and serve over HTTPS.
 - The currency is EUR, and all amounts are stored as integer cents.
 
-> **Upgrading from an earlier version:** the schema is now v2. Run `npm run seed` to rebuild the demo
+> **Upgrading from an earlier version:** the schema is now v3. Run `npm run seed` to rebuild the demo
 > database; the app shows a clear message if it finds an older database.

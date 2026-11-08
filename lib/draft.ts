@@ -13,6 +13,8 @@ export type TxDraft = {
   currency?: string;
   fxRate?: string;
   cashType?: CashType;
+  contactId?: number;
+  orderId?: number;
   amount?: string;
   lines?: { itemId: number; qty: string; amount: string; vatRate?: number }[];
 };

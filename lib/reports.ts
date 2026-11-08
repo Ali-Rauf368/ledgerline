@@ -8,7 +8,7 @@ import type { DB } from "./db.ts";
 import { all, get } from "./db.ts";
 import { ACC, COST_OF_SALES, OTHER_PNL, isDebitNormal } from "./accounts.ts";
 import type { AccountType, JournalKind } from "./accounts.ts";
-import { lockedThrough, monthEnd, nextClosablePeriod, nextMonth, today } from "./ledger.ts";
+import { lockedThrough, monthEnd, nextClosablePeriod, nextMonth, openInvoices, today } from "./ledger.ts";
 
 const MIN_DATE = "0000-01-01";
 const MAX_DATE = "9999-12-31";
@@ -558,4 +558,104 @@ export function fifoComparison(db: DB, f: { from?: string; asOf?: string } = {})
   });
   const sum = (k: "fifoValue" | "avgValue" | "fifoCogs" | "avgCogs") => rows.reduce((t, r) => t + r[k], 0);
   return { rows, fifoValue: sum("fifoValue"), avgValue: sum("avgValue"), fifoCogs: sum("fifoCogs"), avgCogs: sum("avgCogs") };
+}
+
+// ───────────────────────── receivables / payables ─────────────────────────
+
+export const AGE_BUCKETS = ["Current", "1–30", "31–60", "61–90", "90+"] as const;
+
+/** Open-item ageing by days past due (as of a date). Unapplied payments are shown as credits per contact. */
+export function ageing(db: DB, side: "AR" | "AP", asOf = today()) {
+  const items = openInvoices(db, { side }).filter((i) => i.doc_date <= asOf);
+  const contacts = all<{ id: number; name: string; email: string; terms_days: number }>(db, "SELECT id, name, email, terms_days FROM contacts WHERE kind = ?", side === "AR" ? "CUSTOMER" : "SUPPLIER");
+  const bucketOf = (due: string | null, doc: string) => {
+    const days = Math.floor((Date.parse(asOf) - Date.parse(due ?? doc)) / 86400000);
+    return days <= 0 ? 0 : days <= 30 ? 1 : days <= 60 ? 2 : days <= 90 ? 3 : 4;
+  };
+  const rows = new Map<string, { key: string; contactId: number | null; name: string; buckets: number[]; total: number; oldest: string; items: (typeof items[number] & { bucket: number; daysOverdue: number })[] }>();
+  for (const i of items) {
+    const key = i.contact_id ? `c${i.contact_id}` : `n${i.counterparty || "Unassigned"}`;
+    const name = contacts.find((c) => c.id === i.contact_id)?.name ?? (i.counterparty || "Unassigned");
+    const r = rows.get(key) ?? { key, contactId: i.contact_id, name, buckets: [0, 0, 0, 0, 0], total: 0, oldest: i.due_date ?? i.doc_date, items: [] };
+    const b = bucketOf(i.due_date, i.doc_date);
+    r.buckets[b] += i.open;
+    r.total += i.open;
+    if ((i.due_date ?? i.doc_date) < r.oldest) r.oldest = i.due_date ?? i.doc_date;
+    r.items.push({ ...i, bucket: b, daysOverdue: Math.max(0, Math.floor((Date.parse(asOf) - Date.parse(i.due_date ?? i.doc_date)) / 86400000)) });
+    rows.set(key, r);
+  }
+  const unapplied = unappliedPayments(db, side);
+  const list = [...rows.values()].sort((a, b) => b.total - a.total);
+  const totals = AGE_BUCKETS.map((_, k) => list.reduce((t, r) => t + r.buckets[k], 0));
+  const overdue = totals.slice(1).reduce((a, b) => a + b, 0);
+  const grand = totals.reduce((a, b) => a + b, 0);
+  return { side, asOf, rows: list, totals, total: grand, overdue, unapplied, unappliedTotal: unapplied.reduce((t, u) => t + u.amount, 0) };
+}
+
+/** Payments (receipts from customers / payments to suppliers) not fully applied to invoices. */
+export function unappliedPayments(db: DB, side: "AR" | "AP") {
+  const acc = side === "AR" ? ACC.AR : ACC.AP;
+  const col = side === "AR" ? "credit" : "debit";
+  return all<{ id: number; doc_date: string; counterparty: string; contact_id: number | null; amount: number }>(
+    db,
+    `SELECT j.id, j.doc_date, j.counterparty, j.contact_id,
+       (SELECT SUM(${col}) FROM journal_lines WHERE journal_id = j.id AND account_code = ?) - COALESCE((SELECT SUM(amount) FROM allocations WHERE payment_id = j.id), 0) amount
+     FROM journals j WHERE j.kind = 'PAYMENT'
+       AND EXISTS (SELECT 1 FROM journal_lines x WHERE x.journal_id = j.id AND x.account_code = ? AND x.${col} > 0)
+       AND NOT EXISTS (SELECT 1 FROM journals r WHERE r.reverses_id = j.id)
+     ORDER BY j.id`,
+    acc,
+    acc,
+  ).filter((p) => p.amount > 0);
+}
+
+export function contactsOverview(db: DB, kind: "CUSTOMER" | "SUPPLIER") {
+  const contacts = all<{ id: number; name: string; email: string; vat_id: string; terms_days: number; currency: string; created_at: string }>(db, "SELECT * FROM contacts WHERE kind = ? ORDER BY name", kind);
+  const open = openInvoices(db, { side: kind === "CUSTOMER" ? "AR" : "AP" });
+  const t = today();
+  const volume = all<{ contact_id: number; n: number; total: number }>(
+    db,
+    `SELECT j.contact_id, COUNT(*) n, SUM((SELECT MAX(MAX(debit), MAX(credit)) FROM journal_lines WHERE journal_id = j.id)) total
+     FROM journals j WHERE j.kind = ? AND j.contact_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM journals r WHERE r.reverses_id = j.id) AND j.doc_date >= ?
+     GROUP BY j.contact_id`,
+    kind === "CUSTOMER" ? "SALE" : "RECEIPT",
+    new Date(Date.now() - 365 * 86400000).toISOString().slice(0, 10),
+  );
+  return contacts.map((c) => {
+    const mine = open.filter((o) => o.contact_id === c.id);
+    return {
+      ...c,
+      open: mine.reduce((s, o) => s + o.open, 0),
+      overdue: mine.filter((o) => (o.due_date ?? o.doc_date) < t).reduce((s, o) => s + o.open, 0),
+      invoices: mine.length,
+      volume12m: volume.find((v) => v.contact_id === c.id)?.total ?? 0,
+      docs12m: volume.find((v) => v.contact_id === c.id)?.n ?? 0,
+    };
+  });
+}
+
+export function ordersList(db: DB, kind?: "PO" | "SO") {
+  const orders = all<{ id: number; kind: "PO" | "SO"; number: string; contact_id: number; contact: string; order_date: string; expected_date: string | null; currency: string; cancelled_at: string | null; warehouse: string }>(
+    db,
+    `SELECT o.id, o.kind, o.number, o.contact_id, c.name contact, o.order_date, o.expected_date, o.currency, o.cancelled_at, w.name warehouse
+     FROM orders o JOIN contacts c ON c.id = o.contact_id JOIN warehouses w ON w.id = o.warehouse_id
+     ${kind ? "WHERE o.kind = ?" : ""} ORDER BY o.id DESC`,
+    ...(kind ? [kind] : []),
+  );
+  return orders.map((o) => ({ ...o, ...orderProgress(db, o.id, o.cancelled_at) }));
+}
+
+export function orderProgress(db: DB, orderId: number, cancelledAt: string | null) {
+  const lines = all<{ item_id: number; qty: number; unit_amount: number; vat_rate: number }>(db, "SELECT item_id, qty, unit_amount, vat_rate FROM order_lines WHERE order_id = ?", orderId);
+  const done = all<{ item_id: number; qty: number }>(
+    db,
+    `SELECT m.item_id, SUM(ABS(m.qty)) qty FROM stock_moves m JOIN journals j ON j.id = m.journal_id
+     WHERE j.order_id = ? AND NOT EXISTS (SELECT 1 FROM journals r WHERE r.reverses_id = j.id) GROUP BY m.item_id`,
+    orderId,
+  );
+  const ordered = lines.reduce((t, l) => t + l.qty, 0);
+  const delivered = done.reduce((t, d) => t + d.qty, 0);
+  const value = lines.reduce((t, l) => t + l.qty * l.unit_amount, 0);
+  const status = cancelledAt ? (delivered ? "CLOSED" : "CANCELLED") : delivered === 0 ? "OPEN" : delivered >= ordered ? "FULFILLED" : "PARTIAL";
+  return { ordered, delivered, value, status: status as "OPEN" | "PARTIAL" | "FULFILLED" | "CANCELLED" | "CLOSED" };
 }

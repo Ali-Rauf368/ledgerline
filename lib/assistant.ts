@@ -17,7 +17,7 @@ import { draftHref } from "./draft";
 import { all, run } from "./db";
 import { fmtMoney } from "./money";
 import {
-  budgetVsActual, fifoComparison, fxActivity, vatReport, warehouses,
+  AGE_BUCKETS, ageing, budgetVsActual, fifoComparison, fxActivity, vatReport, warehouses,
   balanceSheet, dashboard, incomeStatement, inventoryValuation, itemsOverview, journalDetail, journalsList,
   reorderInsights, stockCard,
 } from "./reports";
@@ -119,6 +119,11 @@ const TOOLS: Anthropic.Beta.BetaTool[] = [
       required: ["kind"],
     },
   },
+  {
+    name: "open_items",
+    description: "Receivables (AR) or payables (AP) ageing by customer/supplier: open invoices bucketed by days past due, overdue totals and unapplied payments.",
+    input_schema: { type: "object", properties: { side: { type: "string", enum: ["AR", "AP"] } }, required: ["side"] },
+  },
   { name: "run_integrity_check", description: "Run the independent ledger verification (hash chain, balancing, sub-ledger reconciliation, closed-period snapshots and more).", input_schema: { type: "object", properties: {} } },
 ];
 
@@ -140,6 +145,7 @@ export const TOOL_LABEL: Record<string, string> = {
   fx_overview: "FX",
   fifo_comparison: "FIFO comparison",
   draft_transaction: "Draft",
+  open_items: "Ageing",
 };
 
 function buildDraft(db: DB, input: Record<string, unknown>): { draft?: TxDraft; label?: string; error?: string } {
@@ -185,6 +191,14 @@ function buildDraft(db: DB, input: Record<string, unknown>): { draft?: TxDraft; 
 
 function runTool(db: DB, name: string, input: Record<string, unknown>, drafts: DraftLink[] = []): unknown {
   switch (name) {
+    case "open_items": {
+      const a = ageing(db, input.side === "AP" ? "AP" : "AR");
+      return {
+        total_open: eur(a.total), overdue: eur(a.overdue), unapplied_payments: eur(a.unappliedTotal),
+        buckets: Object.fromEntries(AGE_BUCKETS.map((b, i) => [b, eur(a.totals[i])])),
+        by_contact: a.rows.slice(0, 12).map((r) => ({ name: r.name, total: eur(r.total), overdue_31_plus: eur(r.buckets[2] + r.buckets[3] + r.buckets[4]), oldest_due: r.oldest, invoices: r.items.map((i) => `#${i.id} ${eur(i.open)} due ${i.due_date ?? i.doc_date} (${i.daysOverdue}d overdue)`).slice(0, 5) })),
+      };
+    }
     case "find_anomalies":
       return detectAnomalies(db, { since: input.since ? String(input.since) : undefined }).slice(0, 25).map((a) => ({ severity: a.severity, type: a.type, title: a.title, detail: a.detail, date: a.date, journal: a.journalId ? `#${a.journalId}` : null }));
     case "demand_forecast":
@@ -379,6 +393,15 @@ function offline(db: DB, q: string): Omit<AssistantReply, "notice"> {
     return {
       text: `Cash is projected at **${eur(c.projected)}** in 30 days (80% range ${eur(c.low)} – ${eur(c.high)}).\n${d.length ? `Likely stock-outs:\n${d.map((x) => `- \`${x.sku}\` around ${x.stockoutDate} (needs ~${x.forecast30} ${x.unit}, has ${x.onHand})`).join("\n")}` : "No item is projected to run out within 30 days."}`,
       tools: [TOOL_LABEL.cash_forecast, TOOL_LABEL.demand_forecast],
+      mode: "offline",
+    };
+  }
+  if (has("overdue", "chase", "owe us", "receivable", "debtor", "remind", "ageing", "aging")) {
+    const a = ageing(db, "AR");
+    const late = a.rows.filter((r) => r.buckets.slice(1).some((x) => x > 0)).slice(0, 5);
+    return {
+      text: `Customers owe **${eur(a.total)}**, of which **${eur(a.overdue)}** is overdue.\n${late.map((r) => `- **${r.name}**: ${eur(r.buckets.slice(1).reduce((x, y) => x + y, 0))} overdue (oldest due ${r.oldest})`).join("\n") || "Nobody is overdue."}`,
+      tools: [TOOL_LABEL.open_items],
       mode: "offline",
     };
   }

@@ -9,8 +9,12 @@ import { all } from "@/lib/db";
 import type { LineRow, MoveRow } from "@/lib/ledger";
 import { fmtDate, fmtQty, fmtTimestamp } from "@/lib/money";
 import { journalDetail } from "@/lib/reports";
+import { pageUser } from "@/lib/session";
+import { can } from "@/lib/auth";
+import { get } from "@/lib/db";
 
 export default async function JournalDetailPage({ params }: { params: Promise<{ id: string }> }) {
+  const user = await pageUser();
   const { id } = await params;
   const db = getDb();
   const d = journalDetail(db, Number(id));
@@ -24,7 +28,14 @@ export default async function JournalDetailPage({ params }: { params: Promise<{ 
   const credits = lines.reduce((s, l) => s + l.credit, 0);
   const fx = j as unknown as { currency: string | null; fx_rate: string | null; foreign_amount: number | null; settles_id: number | null };
   const settledBy = all<{ id: number }>(db, "SELECT s.id FROM journals s WHERE s.settles_id = ? AND NOT EXISTS (SELECT 1 FROM journals r WHERE r.reverses_id = s.id)", j.id)[0]?.id;
-  const canReverse = j.kind !== "REVERSAL" && j.kind !== "CLOSING" && !j.reversed_by && !settledBy;
+  const canReverse = can(user, "reverse") && j.kind !== "REVERSAL" && j.kind !== "CLOSING" && !j.reversed_by && !settledBy;
+  const meta = get<{ by: string | null; appr: string | null; contact_id: number | null; contact: string | null; due_date: string | null; order_id: number | null; order_no: string | null }>(
+    db,
+    `SELECT u.name by, a.name appr, j.contact_id, c.name contact, j.due_date, j.order_id, o.number order_no FROM journals j
+     LEFT JOIN users u ON u.id = j.created_by LEFT JOIN users a ON a.id = j.approved_by LEFT JOIN contacts c ON c.id = j.contact_id LEFT JOIN orders o ON o.id = j.order_id
+     WHERE j.id = ?`,
+    j.id,
+  )!;
 
   return (
     <>
@@ -119,6 +130,11 @@ export default async function JournalDetailPage({ params }: { params: Promise<{ 
                 ["Document date", fmtDate(j.doc_date)],
                 ["Posted at", fmtTimestamp(j.posted_at)],
                 ["Reference", j.reference || "—"],
+                ["Posted by", meta.by ?? "system / import"],
+                ...(meta.appr ? [["Approved by", `${meta.appr} (four-eyes)`]] : []),
+                ...(meta.contact ? [["Account", <Link key="c" href={`/contacts/${meta.contact_id}`} className="text-accent">{meta.contact}</Link>]] : []),
+                ...(meta.due_date ? [["Due", fmtDate(meta.due_date)]] : []),
+                ...(meta.order_no ? [["Order", <Link key="o" href={`/orders/${meta.order_id}`} className="font-mono text-accent">{meta.order_no}</Link>]] : []),
                 ...(fx.currency ? [["Currency", `${(fx.foreign_amount! / (fx.currency === "JPY" ? 1 : 100)).toFixed(fx.currency === "JPY" ? 0 : 2)} ${fx.currency} @ ${fx.fx_rate}`]] : []),
                 ...(fx.settles_id ? [["Settles invoice", <Link key="s" href={`/transactions/${fx.settles_id}`} className="text-accent">#{fx.settles_id}</Link>]] : []),
                 ...(settledBy ? [["Paid by", <Link key="p" href={`/transactions/${settledBy}`} className="text-accent">#{settledBy}</Link>]] : []),
